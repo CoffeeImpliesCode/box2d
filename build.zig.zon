@@ -1,0 +1,141 @@
+// SPDX-License-Identifier: MIT
+.{
+    // The package id and the name a dependent writes in its dependency map.
+    .name = .box2d,
+    // Upstream's own version string, read out of CMakeLists.txt:6
+    // (`project(box2d VERSION 3.1.1 ...)`) and out of src/core.c:69-77, where
+    // `b2GetVersion` returns `{3, 1, 1}`. This is the version of the C library
+    // this package builds, not a version of the wrapper. `build.zig` compares
+    // it against the same constant it stamps into `box2d.pc` and into the
+    // shared object's file name, and refuses to configure if they drift.
+    .version = "3.1.1",
+    .fingerprint = 0xbbd8fcbdd2e75550,
+    .minimum_zig_version = "0.16.0",
+    // Nothing is fetched: the C library is this repository's own source, the
+    // task system its own tests need is vendored under `extern/`, and the
+    // facade, tests, example and consumer import only what is compiled here.
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "build_support",
+        // The cross-test harness profile for this package. It is a file in the
+        // package because it is how this package declares what its
+        // cross-platform gate is: `cross-test` discovers it by name from the
+        // package root, and it is settings only - the standard `zig build
+        // test` step over the full published platform matrix, no target subset
+        // and no host path. Nothing in build.zig reads it.
+        "cross-test.profile.sh",
+        // zig/root.zig is the facade and zig/translate.h the one translated
+        // header. Both travel because a dependent reaches them through
+        // dep.module("box2d").
+        "zig",
+        // The upstream C library, unmodified: the 35 core sources, the six
+        // public headers, and the internal headers only the core, upstream's
+        // own test target and the benchmark tool include. The whole directories
+        // travel rather than a hand-picked file list so that the tree a
+        // dependent receives is upstream's tree.
+        "include",
+        "src",
+        // Upstream's `shared` support library and its own unit test suite,
+        // both unmodified and both compiled by this package's `test` step.
+        "shared",
+        "test",
+        // Upstream's benchmark tool, compiled and installed by `zig build`.
+        "benchmark",
+        // The vendored enkiTS closure that upstream fetches at build time
+        // (CMakeLists.txt:86-95) and that test/test_determinism.c:4 and
+        // benchmark/main.c:8 include. Its bytes, its License.txt and its
+        // example/ directory are the import's, unmodified.
+        "extern/enkiTS",
+        "tests.zig",
+        "smoke.zig",
+        // The separate consumer package: proof that the published module
+        // resolves from a package that did not write it, through a relative
+        // path rather than a fetch. Its three files are named rather than the
+        // `consumer` directory, so this list says exactly what travels.
+        // `consumer/build.zig.zon` declares the relative dependency,
+        // `consumer/build.zig` is the graph that reaches this package through
+        // it and forwards the options, and `consumer/src/main.zig` is the
+        // program that prints what it found.
+        "consumer/build.zig",
+        "consumer/build.zig.zon",
+        "consumer/src/main.zig",
+        // Upstream's own MIT licence text, which covers the whole compiled
+        // library. A private repository removes no licence obligation, so it
+        // ships with the package. README.md is this fork's own file;
+        // README.upstream.md is upstream's pristine text, kept byte for byte
+        // as the record it is.
+        "LICENSE",
+        "README.md",
+        "README.upstream.md",
+        "UPSTREAM.md",
+        "README.zig.md",
+        "NOTICE.md",
+        "CHANGELOG.md",
+        "FORK-NOTES.md",
+        "FORK-LICENSE.md",
+        // The integrity record for the import. It does not describe `.paths`
+        // above, and saying otherwise was wrong in both directions. It pins
+        // all 267 upstream-owned bytes as they stand in this repository, read
+        // by `sha256sum -c UPSTREAM.sha256` from the repository root, and that
+        // set is deliberately wider than what this package ships: 100 of its
+        // lines name files the manifest above withholds - `docs/`, `samples/`,
+        // `.github/`, upstream's own build system (`CMakeLists.txt`,
+        // `build.sh`, `build_emscripten.sh`, `create_sln.bat`,
+        // `deploy_docs.sh`, `.clang-format`, `.gitattributes`) and the two
+        // vendored trees nothing here compiles (`extern/glad`,
+        // `extern/jsmn`). It is also narrower the other way: every
+        // fork-authored entry above is reviewed as source and is deliberately
+        // not pinned.
+        //
+        // So this is a repository-root gate, not a package-closure gate. A
+        // fetched copy receives the record but not the 100 files it names, and
+        // `sha256sum -c` run there reports those 100 as unreadable rather than
+        // passing. The record still travels, because a dependent that receives
+        // this import should receive the file that names what it inherited,
+        // even though the check itself belongs to this tree.
+        "UPSTREAM.sha256",
+        // The runtime loader core the driver owns, this library's generated
+        // dispatch and descriptor beside it, and this library's own tests for
+        // them. They are a dependency of the published module, so a dependent
+        // that fetches this package must receive them. build.zig names
+        // runtime/graph.zig as the one place createModule substitutes for
+        // translate.createModule().
+        "runtime",
+        // Standalone Nix packaging. `package.nix` is the one source-only
+        // derivation and builds the `.static` and `.shared` variants of this
+        // same tree; `flake.nix` exposes them; `devenv.nix`, `devenv.yaml` and
+        // `.envrc` provide the canonical development shell. They travel
+        // because a dependent who unpacks this package must be able to build it
+        // the way the project's own `flake.nix` and `devenv.nix` do, and
+        // because `zig build` neither reads nor reproduces them.
+        //
+        // `flake.lock` travels with `flake.nix`, and it is the only lock here
+        // that does. It is a real input derived from an observed resolution and
+        // `zig fetch` hashes it like any other packaged file, so a manifest that
+        // shipped the flake without its lock would describe a package nobody
+        // resolved. Its contents are this fork's resolution and its bytes are
+        // not upstream's, so it is deliberately not in `UPSTREAM.sha256` and
+        // does not change that record's count; `sha256sum -c` checks the lines
+        // a record names and never walks `.paths`.
+        //
+        // `devenv.lock` stays unlisted because it does not exist in this tree.
+        // That is a fact about the tree, not a policy: naming an absent path
+        // makes `zig fetch` hash a missing entry. It belongs here the moment a
+        // real resolution produces one, which is the driver's to make.
+        "package.nix",
+        "flake.nix",
+        "flake.lock",
+        "devenv.nix",
+        "devenv.yaml",
+        ".envrc",
+        //
+        // `.github/` is deliberately absent: this package's workflow is
+        // repository CI, not package content, and a dependent who fetches this
+        // package must not receive a workflow that would run against their
+        // repository. Upstream's own `.github/workflows/build.yml` stays in the
+        // tree as the record it is and is never executed by this package - it
+        // configures CMake, which this package never runs.
+    },
+}

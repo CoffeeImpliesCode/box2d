@@ -1,0 +1,26 @@
+.{
+    // The package id. It is deliberately *not* `box2d`: this is a different
+    // package with a different name, and naming it the same would make
+    // `zig build` inside this directory ambiguous about which manifest it is
+    // reading.
+    .name = .box2d_consumer,
+    .version = "0.1.0",
+    // This package's own identity, the value the toolchain derived for the
+    // name above. It is not the library's fingerprint: a consumer is a
+    // different package, so a dependent can tell the two apart, and changing
+    // it has security and trust implications.
+    .fingerprint = 0xa755fa1cd0d1a9e6,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        // A relative path, not a registry or archive URL. The consumer is the
+        // proof that `dep.module("box2d")` works from outside the package that
+        // defines it; resolving that through the network would make the proof
+        // depend on a published state of the world instead.
+        .box2d = .{ .path = ".." },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

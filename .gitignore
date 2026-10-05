@@ -1,0 +1,51 @@
+build/
+imgui.ini
+settings.ini
+.vscode/
+.vs/
+.cap
+.DS_Store
+CMakeUserPresets.json
+.cache/
+.idea/
+
+# ---------------------------------------------------------------------------
+# Fork additions. Everything above this line is upstream's own ignore list at
+# tag v3.1.1, all ten patterns in their original order, kept verbatim. None was
+# removed, reordered relative to another, or weakened.
+#
+# The rules below are this fork's own build outputs. This package compiles with
+# Zig and never runs CMake, so upstream's rules are kept because upstream's tree
+# depends on them, not because this build produces them.
+#
+# None of the paths below is named in build.zig.zon `.paths`, so an ignored path
+# can never become part of the package a dependent fetches.
+#
+# Directories rather than single files, because a normal `zig build` creates
+# directories and a normal `zig build` must not dirty the tree.
+.zig-cache/
+zig-out/
+# Zig 0.16 materialises a fetched dependency tree beside the package root.
+# This package declares no dependencies, so this exists only so that a future
+# one cannot commit a fetched tree.
+zig-pkg/
+
+# The consumer package builds inside this repository and has its own cache and
+# output tree. It is ignored here as well as in consumer/.gitignore, so a build
+# run from the repository root cannot commit it by accident.
+consumer/.zig-cache/
+consumer/zig-out/
+consumer/zig-pkg/
+
+# Nix and devenv working-tree artefacts. `nix build` writes `result` (and
+# `result-1`, `result-2`, ... on a rebuild) into the directory that asked for
+# it, and `devenv` writes its resolved inputs and its state beside the project.
+# `devenv.lock` and `flake.lock` are deliberately *not* here: they are real
+# inputs, they belong to the driver, and ignoring them would be the wrong way
+# to keep a build out of a commit.
+result
+result-*
+.devenv/
+.devenv.flake.nix
+.devenv.flakes/
+devenv.local.nix
