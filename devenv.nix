@@ -7,7 +7,7 @@ let
   mkBox2d = linkage:
     pkgs.callPackage ./package.nix {
       inherit linkage;
-      zig = pkgs.zig_0_16;
+      zig = pkgs.zig_0_17;
     };
 
   # Read for its declared identity only; reading `.version` does not realise it.
@@ -51,7 +51,7 @@ in
 {
   # The shell includes tools only; entering it does not build the SDK.
   packages = [
-    pkgs.zig_0_16
+    pkgs.zig_0_17
     pkgs.pkg-config
     pkgs.git
   ];
@@ -197,9 +197,9 @@ in
 
   assertions = [
     {
-      assertion = pkgs.zig_0_16.version == "0.16.0";
-      message = "box2d is written against Zig 0.16.0; this nixpkgs exposes "
-        + pkgs.zig_0_16.version;
+      assertion = pkgs.zig_0_17.version == "0.17.0";
+      message = "box2d is written against Zig 0.17.0; this nixpkgs exposes "
+        + pkgs.zig_0_17.version;
     }
   ];
 }

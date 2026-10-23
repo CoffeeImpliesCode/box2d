@@ -1,5 +1,5 @@
 # cross-test profile sourced from the package root.
-# Uses the published Zig 0.16.0 Tier 1/2 target table.
+# Uses the published Zig 0.17.0 Tier 1/2 target table.
 # The harness selects matrix targets, paths and runners.
 # Only variable assignments; the harness may source this file repeatedly.
 

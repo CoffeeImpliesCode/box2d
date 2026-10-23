@@ -25,7 +25,7 @@ let
     "include/box2d/math_functions.h"
     "include/box2d/types.h"
     "lib/pkgconfig/box2d.pc"
-    # WASI lacks std::thread in Zig 0.16's C++ runtime, so no benchmark is built there.
+    # WASI lacks std::thread in Zig 0.17's C++ runtime, so no benchmark is built there.
     "bin/box2d-benchmark"
   ];
 

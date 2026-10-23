@@ -600,7 +600,7 @@ test "the dynamic tree returns exactly the proxies inside the query box" {
     );
     if (found.count != 3) return error.WrongQueryResultCount;
     for ([_]u64{ 100, 200, 300 }) |value| {
-        if (std.mem.indexOfScalar(u64, found.saw[0..found.count], value) == null) return error.WrongQueryResults;
+        if (std.mem.findScalar(u64, found.saw[0..found.count], value) == null) return error.WrongQueryResults;
     }
 
     // A query around the middle proxy returns only that proxy.
@@ -626,7 +626,7 @@ test "the dynamic tree returns exactly the proxies inside the query box" {
     );
     if (after_move.count != 2) return error.MoveNotObserved;
     for ([_]u64{ 100, 200 }) |value| {
-        if (std.mem.indexOfScalar(u64, after_move.saw[0..after_move.count], value) == null) return error.MoveNotObserved;
+        if (std.mem.findScalar(u64, after_move.saw[0..after_move.count], value) == null) return error.MoveNotObserved;
     }
 
     // Destroying a proxy decrements the count.

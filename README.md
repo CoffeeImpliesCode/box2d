@@ -7,7 +7,7 @@ This package builds its C library with Zig and provides a typed Zig module.
 
 - The upstream Box2D trees are unchanged: `include/`, `src/`, `test/`, `shared/`, `benchmark/`, `samples/`, `docs/`, `extern/glad/` and `extern/jsmn/`.
 - The fork extends upstream's `.gitignore` with its own ignore patterns.
-- `build_support/box2d_inline_bridge.c` exports `b2MakeAABB`, which Zig 0.16 cannot translate from its inline definition.
+- `build_support/box2d_inline_bridge.c` exports `b2MakeAABB` because translate-c emits its inline definition as an unresolved external declaration.
 
 ## Build deviations
 
@@ -18,7 +18,7 @@ This package builds its C library with Zig and provides a typed Zig module.
 
 ## Support matrix
 
-Zig 0.16.0 is the minimum version. `zig build check` uses this six-target compile/link matrix; it does not describe runtime test coverage:
+Zig 0.17.0 is the minimum version. `zig build check` uses this six-target compile/link matrix; it does not describe runtime test coverage:
 
 | Target | Static | Dynamic |
 | --- | --- | --- |
@@ -29,7 +29,7 @@ Zig 0.16.0 is the minimum version. `zig build check` uses this six-target compil
 | `riscv64-linux-gnu` | yes | yes |
 | `wasm32-wasi` | yes | no |
 
-WASI has no dynamic linker. Its Zig 0.16 C++ library also has no threads, so the benchmark is not built for that target.
+WASI has no dynamic linker. Its Zig 0.17.0 C++ library also has no threads, so the benchmark is not built for that target.
 
 ## Consumption
 

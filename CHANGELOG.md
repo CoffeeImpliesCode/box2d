@@ -1,6 +1,7 @@
 # Changelog
 
-- `zig build consumer` runs the consumer when the host can execute its target and otherwise installs `bin/box2d-consumer`.
+- Port to Zig 0.17.0.
+- `zig build consumer` runs native targets; cross-target builds try an enabled executor and install the artifact in the caller's prefix.
 - Nested consumer builds inherit the SDK build's target, CPU, optimize mode, linkage, runtime, validation, SIMD settings, and command-line arguments.
 - Nested consumer builds use the caller's local and global caches, prefix, job count, and summary setting.
 - NetBSD builds preprocess the translation header with the target C preprocessor before Zig translation.

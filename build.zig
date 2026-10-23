@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! Zig 0.16 build for the Box2D 2D physics engine.
+//! Zig 0.17 build for the Box2D 2D physics engine.
 
 const std = @import("std");
 
@@ -157,7 +157,7 @@ const Tools = struct {
 };
 
 const Options = struct {
-    requested_linkage: std.builtin.LinkMode,
+    requested_linkage: std.lang.LinkMode,
     validate: bool,
     disable_simd: bool,
     avx2: bool,
@@ -178,7 +178,7 @@ fn artifactName(
 /// Reject dynamic linkage when the target has no dynamic loader.
 fn targetCanCarry(
     target: std.Build.ResolvedTarget,
-    requested: std.builtin.LinkMode,
+    requested: std.lang.LinkMode,
 ) bool {
     return requested == .static or target.result.os.tag == .windows or std.Target.DynamicLinker.kind(target.result.os.tag) != .none;
 }
@@ -197,7 +197,7 @@ fn unsupportedLinkageReason(
     );
 }
 
-/// Zig 0.16's wasm32-wasi C++ runtime has no threads.
+/// Zig 0.17's wasm32-wasi C++ runtime has no threads.
 fn targetHasCxxThreads(target: std.Build.ResolvedTarget) bool {
     return target.result.os.tag != .wasi;
 }
@@ -273,7 +273,7 @@ fn coreSystemLibraries(target: std.Build.ResolvedTarget) []const []const u8 {
 fn addCoreLibrary(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     options: Options,
     name: []const u8,
 ) *std.Build.Step.Compile {
@@ -334,7 +334,7 @@ fn addCoreLibrary(
 fn addSupportLibrary(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     name: []const u8,
 ) *std.Build.Step.Compile {
     const support_mod = b.createModule(.{
@@ -361,7 +361,7 @@ fn addSupportLibrary(
 fn addEnkiTS(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     name: []const u8,
 ) ?*std.Build.Step.Compile {
     if (!targetHasCxxThreads(target)) return null;
@@ -402,7 +402,7 @@ fn posixThreadLibraries(target: std.Build.ResolvedTarget) []const []const u8 {
 fn addUpstreamTest(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     graph: Graph,
     tools: Tools,
     name: []const u8,
@@ -434,7 +434,7 @@ fn addUpstreamTest(
 fn addBenchmark(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     graph: Graph,
     tools: Tools,
     name: []const u8,
@@ -483,19 +483,19 @@ fn preprocessedTranslateHeader(
         run.addArg("-target");
         run.addArg(triple);
     }
-    run.addPrefixedDirectoryArg("-I", b.path(include_dir));
+    run.addDirectoryArg2(b.path(include_dir), .{ .prefix = "-I" });
     run.addArg("-o");
-    const preprocessed = run.addOutputFileArg("box2d-translate.c");
+    const preprocessed = run.addOutputFileArg2("box2d-translate.c", .{});
     run.addArg("-MD");
-    _ = run.addPrefixedDepFileOutputArg("-MF", "box2d-translate.d");
-    run.addFileArg(b.path(translate_header));
+    _ = run.addDepFileOutputArg2("box2d-translate.d", .{ .prefix = "-MF" });
+    run.addFileArg2(b.path(translate_header), .{});
     return preprocessed;
 }
 
 fn addGraph(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     options: Options,
     public: bool,
 ) struct { graph: Graph, tools: Tools } {
@@ -583,7 +583,7 @@ const llvm_required = true;
 fn programModule(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     module: *std.Build.Module,
     source: []const u8,
 ) *std.Build.Module {
@@ -601,7 +601,7 @@ fn addTargetCheck(
     b: *std.Build,
     step: *std.Build.Step,
     query: std.Target.Query,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     options: Options,
 ) void {
     const cross_target = b.resolveTargetQuery(query);
@@ -643,7 +643,7 @@ fn addTargetCheck(
 
 /// Writes relocatable pkg-config metadata.
 /// Adds libm for glibc/musl and BOX2D_DLL for shared Windows builds.
-fn addPkgConfig(b: *std.Build, target: std.Build.ResolvedTarget, linkage: std.builtin.LinkMode) void {
+fn addPkgConfig(b: *std.Build, target: std.Build.ResolvedTarget, linkage: std.lang.LinkMode) void {
     var libs: std.ArrayList([]const u8) = .empty;
     libs.appendSlice(b.allocator, &.{ "-L\"${libdir}\"", "-lbox2d" }) catch @panic("OOM");
     for (coreSystemLibraries(target)) |lib| {
@@ -698,7 +698,7 @@ fn installLicenceRecords(b: *std.Build) void {
 fn runConsumer(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     options: Options,
 ) *std.Build.Step.Run {
     const triple = target.query.zigTriple(b.allocator) catch @panic("OOM");
@@ -710,8 +710,13 @@ fn runConsumer(
     // Run the same Zig executable that configured this build.
     const run = b.addSystemCommand(&.{ b.graph.zig_exe, "build" });
     run.setName("consumer package");
-    run.setCwd(b.path("consumer"));
-    run.addArg(if (hostCanExecute(b, target)) "run" else "install");
+    // Keep the caller's cwd for relative cache and Zig library environment paths.
+    run.addArg("--build-file");
+    run.addFileArg2(b.path("consumer/build.zig"), .{ .make_absolute = true });
+    for ([_][]const u8{ "ZIG_GLOBAL_CACHE_DIR", "ZIG_LIB_DIR" }) |key| {
+        if (b.graph.environ_map.get(key)) |value| run.setEnvironmentVariable(key, value);
+    }
+    run.addArg(if (hostCanRunNatively(b, target)) "run" else "consumer");
     run.addArg(b.fmt("-Dtarget={s}", .{triple}));
     run.addArg(b.fmt("-Dcpu={s}", .{cpu}));
     run.addArg(b.fmt("-Doptimize={s}", .{@tagName(optimize)}));
@@ -720,58 +725,42 @@ fn runConsumer(
     run.addArg(b.fmt("-Dvalidate={s}", .{if (options.validate) "true" else "false"}));
     run.addArg(b.fmt("-Ddisable-simd={s}", .{if (options.disable_simd) "true" else "false"}));
     run.addArg(b.fmt("-Davx2={s}", .{if (options.avx2) "true" else "false"}));
-    if (b.enable_darling) run.addArg("-fdarling");
-    if (b.enable_qemu) run.addArg("-fqemu");
-    if (b.enable_rosetta) run.addArg("-frosetta");
-    if (b.enable_wasmtime) run.addArg("-fwasmtime");
-    if (b.enable_wine) run.addArg("-fwine");
-    if (b.libc_runtimes_dir) |runtimes| run.addArgs(&.{ "--libc-runtimes", runtimes });
+    run.addThirdPartyEnabledArgDarling(.{ .enabled = "-fdarling" });
+    run.addThirdPartyEnabledArgQemu(.{ .enabled = "-fqemu" });
+    run.addThirdPartyEnabledArgRosetta(.{ .enabled = "-frosetta" });
+    run.addThirdPartyEnabledArgWasmtime(.{ .enabled = "-fwasmtime" });
+    run.addThirdPartyEnabledArgWine(.{ .enabled = "-fwine" });
     // Match this build's job width and summary in the nested build.
     run.addArg("-j8");
     run.addArgs(&.{ "--summary", "all" });
-    if (b.cache_root.path) |cache| {
-        run.addArg("--cache-dir");
-        run.addArg(b.fmt("{s}/consumer", .{cache}));
-    }
-    // Share the global package store; keep the local cache separate.
-    if (b.graph.global_cache_root.path) |global_cache| {
-        run.addArgs(&.{ "--global-cache-dir", global_cache });
-    }
-    // Forward an absolute prefix because the nested build runs in consumer/.
-    const default_prefix = b.build_root.join(b.allocator, &.{"zig-out"}) catch @panic("OOM");
-    if (!std.mem.eql(u8, b.install_prefix, default_prefix)) {
-        const prefix = if (std.fs.path.isAbsolute(b.install_prefix))
-            b.install_prefix
-        else
-            b.pathJoin(&.{ b.graph.cache.cwd, b.install_prefix });
-        run.addArg("--prefix");
-        run.addArg(prefix);
-    }
-    if (b.args) |args| {
-        run.addArg("--");
-        run.addArgs(args);
-    }
+    run.addArg("--cache-dir");
+    run.addDirectoryArg2(
+        .{ .relative = .{ .base = .local_cache, .sub_path = "consumer" } },
+        .{ .make_absolute = true },
+    );
+    // The install prefix is resolved when this run step executes.
+    run.addArg("--prefix");
+    run.addDirectoryArg2(
+        .{ .relative = .{ .base = .install_prefix } },
+        .{ .make_absolute = true },
+    );
+    run.addArg("--");
+    run.addPassthruArgs();
     run.has_side_effects = true;
     return run;
 }
 
-fn hostCanExecute(b: *std.Build, target: std.Build.ResolvedTarget) bool {
+fn hostCanRunNatively(b: *std.Build, target: std.Build.ResolvedTarget) bool {
     const host = &b.graph.host.result;
     const candidate = &target.result;
-    const options: std.zig.system.GetExternalExecutorOptions = .{
-        .allow_darling = b.enable_darling,
-        .allow_qemu = b.enable_qemu,
-        .allow_wasmtime = b.enable_wasmtime,
-        .allow_wine = b.enable_wine,
-        // QEMU needs libc runtimes to load foreign glibc executables.
-        .qemu_fixes_dl = candidate.isGnuLibC() and b.libc_runtimes_dir != null,
+    return switch (std.zig.system.getExternalExecutor(b.graph.io, candidate, .{
+        .host_cpu_arch = host.cpu.arch,
+        .host_os_tag = host.os.tag,
+        .link_mode = .dynamic,
         .link_libc = true,
-    };
-    return switch (std.zig.system.getExternalExecutor(b.graph.io, host, candidate, options)) {
-        .native, .rosetta => true,
-        .qemu => !candidate.isGnuLibC() or b.libc_runtimes_dir != null,
-        .wine, .wasmtime, .darling => true,
-        .bad_dl, .bad_os_or_cpu => false,
+    })) {
+        .native => true,
+        else => false,
     };
 }
 
@@ -780,7 +769,7 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     const linkage_option = b.option(
-        std.builtin.LinkMode,
+        std.lang.LinkMode,
         "linkage",
         "Deliver the native library as a static archive (the default, and what " ++
             "upstream's own build produces) or as a real shared object with " ++
@@ -789,7 +778,7 @@ pub fn build(b: *std.Build) void {
     );
 
     // Upstream defaults to static, which also enables its test target.
-    const requested_linkage: std.builtin.LinkMode = linkage_option orelse .static;
+    const requested_linkage: std.lang.LinkMode = linkage_option orelse .static;
 
     const options: Options = .{
         .requested_linkage = requested_linkage,
@@ -859,7 +848,7 @@ pub fn build(b: *std.Build) void {
     b.getInstallStep().dependOn(&example.step);
 
     const run_example = b.addRunArtifact(example);
-    if (b.args) |args| run_example.addArgs(args);
+    run_example.addPassthruArgs();
     b.step("smoke", "Run the deterministic example program").dependOn(&run_example.step);
 
     // tests.zig declares the test blocks; re-exports alone discover none.
@@ -898,7 +887,7 @@ pub fn build(b: *std.Build) void {
         b.step("benchmark", "Build upstream's benchmark/main.c tool").dependOn(&tool.step);
     }
 
-    b.step("consumer", "Build the consumer/ package for the selected target, and run it when this host can execute it")
+    b.step("consumer", "Build the consumer, run it when possible, and install cross-target artifacts")
         .dependOn(&runConsumer(b, target, optimize, options).step);
 
     const check_step = b.step(

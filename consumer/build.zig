@@ -11,7 +11,7 @@ pub fn build(b: *std.Build) void {
 
     // Declare forwarded options without defaults, preserving the dependency's defaults.
     const linkage = b.option(
-        std.builtin.LinkMode,
+        std.lang.LinkMode,
         "linkage",
         "Forwarded to the box2d dependency unchanged. It selects which artifact " ++
             "the library module links; it does not change anything in this " ++
@@ -76,11 +76,20 @@ pub fn build(b: *std.Build) void {
         .use_llvm = true,
         .root_module = exe_mod,
     });
-    b.installArtifact(exe);
+    const install_exe = b.addInstallArtifact(exe, .{});
+    b.getInstallStep().dependOn(&install_exe.step);
 
     const run_exe = b.addRunArtifact(exe);
     // Forward the caller's arguments after `--`.
-    if (b.args) |args| run_exe.addArgs(args);
+    run_exe.addPassthruArgs();
     run_exe.has_side_effects = true;
     b.step("run", "Build and run the consumer program").dependOn(&run_exe.step);
+
+    const try_run_exe = b.addRunArtifact(exe);
+    try_run_exe.addPassthruArgs();
+    try_run_exe.failing_to_execute_foreign_is_an_error = false;
+    try_run_exe.has_side_effects = true;
+    const consumer_step = b.step("consumer", "Run the consumer when possible and install it");
+    consumer_step.dependOn(&try_run_exe.step);
+    consumer_step.dependOn(&install_exe.step);
 }

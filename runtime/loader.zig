@@ -90,7 +90,7 @@ fn validateSource(source: LoadSource) LoadError!void {
     };
     if (text.len == 0) return error.EmptySource;
     if (text.len > max_source_len) return error.SourceTooLong;
-    if (std.mem.indexOfScalar(u8, text, 0) != null) return error.InvalidSource;
+    if (std.mem.findScalar(u8, text, 0) != null) return error.InvalidSource;
     switch (source) {
         .path => {
             const absolute = if (builtin.os.tag == .windows)
@@ -124,22 +124,22 @@ pub const Phase = enum(u8) {
 /// Readiness flag published after the table is complete.
 /// Release stores pair with acquire reads in routed calls.
 pub const Ready = struct {
-    phase: std.atomic.Value(u8) = .init(@intFromEnum(Phase.not_loaded)),
+    phase: std.atomic.Value(u8) = .init(@backingInt(Phase.not_loaded)),
 
     /// True once a load has succeeded. One acquire load, which is what a routed
     /// call pays before it is allowed to touch the table.
     pub fn isReady(self: *const Ready) bool {
-        return self.phase.load(.acquire) == @intFromEnum(Phase.ready);
+        return self.phase.load(.acquire) == @backingInt(Phase.ready);
     }
 
     /// The current state, for the loader's own decisions under its lock.
     pub fn state(self: *const Ready) Phase {
-        return @enumFromInt(self.phase.load(.acquire));
+        return @fromBackingInt(@intCast(self.phase.load(.acquire)));
     }
 
     /// Publish or withdraw the table, with release ordering.
     pub fn set(self: *Ready, value: Phase) void {
-        self.phase.store(@intFromEnum(value), .release);
+        self.phase.store(@backingInt(value), .release);
     }
 };
 

@@ -3,7 +3,7 @@
 
   # Pin nixpkgs here and keep its resolved input in flake.lock.
   inputs.nixpkgs.url =
-    "github:NixOS/nixpkgs/c7def046b9a883d46974757852106483d741586f";
+    "github:NixOS/nixpkgs/02c087f3fe673c9e317f206a627cb6b910336dbe";
 
   outputs =
     { self, nixpkgs }:
@@ -21,13 +21,13 @@
     {
       # Exposes static and shared derivations; static is the default.
       packages = forAllSystems (pkgs:
-        # Use the pinned Zig 0.16.0 package, not the moving pkgs.zig alias.
-        assert pkgs.zig_0_16.version == "0.16.0";
+        # Use the pinned Zig 0.17.0 package, not the moving pkgs.zig alias.
+        assert pkgs.zig_0_17.version == "0.17.0";
         # Without -Dtarget, build and host platforms must match.
         assert pkgs.stdenv.hostPlatform.system == pkgs.stdenv.buildPlatform.system;
         let
           box2d = linkage: pkgs.callPackage ./package.nix {
-            zig = pkgs.zig_0_16;
+            zig = pkgs.zig_0_17;
             inherit linkage;
           };
         in
@@ -42,7 +42,7 @@
         default = pkgs.mkShell {
           name = "box2d";
           packages = [
-            pkgs.zig_0_16
+            pkgs.zig_0_17
             pkgs.pkg-config
             pkgs.gnumake
             pkgs.git

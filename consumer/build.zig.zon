@@ -10,7 +10,7 @@
     // different package, so a dependent can tell the two apart, and changing
     // it has security and trust implications.
     .fingerprint = 0xa755fa1cd0d1a9e6,
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         // A relative path, not a registry or archive URL. The consumer is the
         // proof that `dep.module("box2d")` works from outside the package that

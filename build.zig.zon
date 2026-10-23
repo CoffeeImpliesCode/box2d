@@ -4,7 +4,7 @@
     // Matches the upstream C library version in CMakeLists.txt and b2GetVersion.
     .version = "3.1.1",
     .fingerprint = 0xbbd8fcbdd2e75550,
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     // No package dependencies; source code and enkiTS are local.
     .dependencies = .{},
     .paths = .{
