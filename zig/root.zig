@@ -1,284 +1,35 @@
 // SPDX-License-Identifier: MIT
 //
-//! Zig facade over Box2D's canonical C implementation.
+//! Zig facade for Box2D's C API; simulation and native types remain upstream's.
 //!
-//! No part of the simulation is reimplemented here. Every number this module
-//! returns is produced by the C under `src/`, reached through `pub const c`, the
-//! module `b.addTranslateC` produces from `zig/translate.h` and the six public
-//! headers it includes. What the facade adds is the part a C header cannot
-//! express: a slice the compiler bounds instead of a `capacity` the caller can
-//! get wrong, a creation that can be *refused* rather than silently answered
-//! with a null handle, an out-parameter pair returned as a value, and one
-//! documented statement about who owns what.
-//!
-//! ## Import routes
-//!
-//! One Zig route is published: `dep.module("box2d")` in the dependent's
-//! `build.zig`, which is `@import("box2d")` in source. The raw translated header
-//! is `c` on that same module and is not published as a module of its own, so
-//! the declarations and the library that satisfies them arrive through one
-//! route. A C consumer takes the installed header and archive instead;
-//! `README.zig.md` names that layout.
-//!
-//! The shortest sequence that uses this module:
-//!
-//! ```zig
-//! const std = @import("std");
-//! const box2d = @import("box2d");
-//!
-//! pub fn main() void {
-//!     var world_def = box2d.defaultWorldDef();
-//!     world_def.gravity = box2d.vec2(0, -10);
-//!     const world = box2d.createWorld(&world_def) catch unreachable;
-//!
-//!     var ground_def = box2d.defaultBodyDef();
-//!     ground_def.position = box2d.vec2(0, -1);
-//!     const ground = box2d.createBody(world, &ground_def) catch unreachable;
-//!
-//!     var ground_shape_def = box2d.defaultShapeDef();
-//!     const ground_box = box2d.makeBox(10, 1);
-//!     _ = box2d.createPolygonShape(ground, &ground_shape_def, &ground_box) catch unreachable;
-//!
-//!     var step: u32 = 0;
-//!     while (step < 60) : (step += 1) box2d.worldStep(world, 1.0 / 60.0, 4);
-//!     box2d.destroyWorld(world);
-//! }
-//! ```
-//!
-//! This package is developed and gated against Zig 0.16.0, which is the floor
-//! `build.zig.zon` records.
-//!
-//! ## Names, and how to find the header for one
-//!
-//! Every function here is the C entry point with the `b2` prefix removed and the
-//! rest camel-cased, so `bodyGetPosition` is `b2Body_GetPosition`
-//! (`include/box2d/box2d.h:239`) and `worldCastRayClosest` is
-//! `b2World_CastRayClosest` (`include/box2d/box2d.h:76`). Every doc comment
-//! names the header line it came from. Nothing is renamed beyond that rule, so
-//! the raw route and this one can be read side by side.
-//!
-//! ## What this module does not do
-//!
-//! It allocates nothing and owns nothing. There is no `World` type here that
-//! hides upstream's state and no `deinit` to forget: a world is a `WorldId`,
-//! which is a `b2WorldId` (`include/box2d/id.h:37`), and it is destroyed by
-//! `destroyWorld`. Every struct this module names is upstream's own type, reached
-//! through an alias, so a value produced here can be handed to `c` directly and
-//! vice versa.
-//!
-//! It also does not wrap Box2D's pointers in Zig types. Upstream's own ids are
-//! the handle, upstream's own structs are the payload, and a wrapper that hid
-//! them would hide the generation checks that make stale-handle bugs
-//! *detectable* rather than silent.
-//!
-//! ## Ownership, copying, and invalidation
-//!
-//! These are the rules a caller has to know, and they are upstream's, restated
-//! where a header cannot:
-//!
-//!   * **Definitions are copied, never retained.** `createWorld`, `createBody`,
-//!     `createChain` and the joint creators all take `*const b2*Def` and read it
-//!     during the call; upstream stores values out of it, never the pointer
-//!     (`include/box2d/box2d.h:203-208`). `createChain` is the one that *copies
-//!     an array*: `b2ChainDef.points` is read and cloned
-//!     (`include/box2d/types.h:434`), so the slice may be a temporary.
-//!   * **Geometry is copied.** `b2CreateCircleShape` and friends copy the
-//!     `b2Circle`/`b2Capsule`/`b2Polygon` they are given
-//!     (`src/shape.c:163-192`), so the caller's value is free afterwards.
-//!   * **Event arrays are borrowed and short-lived.** Every `*Events` function
-//!     returns a slice into memory the *world* owns. It is valid until the next
-//!     `worldStep` of that world or until that world is destroyed, and a
-//!     destroy inside the loop makes individual entries name handles that are
-//!     already stale, which is why upstream documents the shape ids in an
-//!     end-touch event as possibly destroyed
-//!     (`include/box2d/types.h:1015-1016`). `bodyMoveEvents` and friends
-//!     document this per function and return `[]const T`, never a copy.
-//!   * **Destroying a world destroys its bodies, shapes and joints.** There is
-//!     no order to respect and nothing to release afterwards: `b2DestroyWorld`
-//!     frees every pool the world owns (`src/world.c:263`). After it, every id
-//!     that world handed out fails its `*IsValid` check.
-//!   * **A destroyed handle is never reused as the same handle.** Freeing a
-//!     body or shape bumps that slot's generation (`src/body.c:297`,
-//!     `src/shape.c:123`) and destroying a world bumps the world's
-//!     (`src/world.c:354`), so a stale id stays invalid even when the index it
-//!     names is handed out again. That is what `*IsValid` is for, and it is the
-//!     only safe way to ask about a handle you are not sure of.
-//!   * **A query callback is never null, and never may be.** Eight entry points
-//!     take one — `dynamicTreeQuery`, `dynamicTreeRayCast`,
-//!     `dynamicTreeShapeCast`, `worldOverlapAabb`, `worldOverlapShape`,
-//!     `worldCastRay`, `worldCastShape` and `worldCollideMover`. Each is
-//!     `?*const` because that is the shape of the C parameter
-//!     (`include/box2d/collision.h:697`, `:720`, `:741`;
-//!     `include/box2d/box2d.h:54`, `:58`, `:71`, `:80`, `:89`), not because
-//!     null carries a meaning. Upstream calls it with no null test at
-//!     `src/dynamic_tree.c:1146`, `:1245` and `:1375`, and through its own
-//!     wrapper at `src/world.c:2067`, `:2143`, `:2208`, `:2336` and `:2505`,
-//!     so a null callback is a call through a null function pointer at the
-//!     first leaf or overlapping shape the query reaches, and the process does
-//!     not survive it. It is a caller precondition, not a way to ask for the
-//!     `TreeStats` counters alone. Two callbacks here are genuinely optional
-//!     and are documented where they are declared:
-//!     `worldSetFrictionCallback` and `worldSetRestitutionCallback`, where
-//!     upstream reads null as "restore the default" (`src/world.c:1913-1919`,
-//!     `:1931-1937`).
-//!
-//! ## Two configurations: linked and runtime-loaded
-//!
-//! This module is built in one of two shapes, and `runtime_loaded` says which
-//! at comptime.
-//!
-//! *Linked* is the default. The C library is linked, `c` is the translated
-//! header, and every call below is a direct call with no table and no check.
-//!
-//! *Runtime-loaded* is opt-in. The library is not linked; `c` is a dispatch
-//! generated from the same translation step's output, and the Box2D entry points
-//! are resolved through the platform loader when the caller calls
-//!
-//! ```zig
-//! try box2d.load(.{ .path = "/usr/lib/libbox2d.so.3" });
-//! ```
-//!
-//! before using anything else. A call into a module that has not loaded stops
-//! the program with a message naming the function, in every optimization mode.
-//! That is a programming error rather than a recoverable condition: the table
-//! does not exist yet and there is no partial state to fall back on. The load
-//! itself reports a missing file, a provider that does not export what the
-//! header declares, a request that cannot be honoured because a different
-//! provider already won, or a reentrant call, as errors rather than as a
-//! different library being loaded instead.
-//!
-//! The provider is reached, never guessed. `.path` names a file and `.system`
-//! names a library for the platform loader; neither falls back to the other,
-//! there is no unload and no reset, and the handle and its own copy of the
-//! request live to the end of the process. What a provider must be is stated in
-//! `runtime/library.zig`.
-//!
-//! ## Errors
-//!
-//! This module returns one error set, `CreateError`, and it is deliberately
-//! small. It is exactly the ways one of these calls declines — a null handle
-//! upstream returns, or the zero-count hull `computeHull` reports — and
-//! nothing else:
-//!
-//!   * `createWorld` reports `WorldLimitReached` for upstream's
-//!     `(b2WorldId){ 0 }` return, which `src/world.c:115-118` produces when all
-//!     `B2_MAX_WORLDS` slots are in use.
-//!   * `createBody`, the four `create*Shape` functions and `createChain` report
-//!     `WorldLocked` for the null id they return when the world is locked, which
-//!     is the case while a step or a callback is running (`src/body.c:192-195`,
-//!     `src/shape.c:172-176`). `createSegmentShape` reports the same error for a
-//!     second upstream refusal, a segment at or below the linear slop
-//!     (`src/shape.c:219-224`), which this wrapper cannot tell apart from a lock.
-//!   * `computeHull` reports `HullNotConvex` for the hull whose `count` is zero,
-//!     which `src/hull.c:89-96` returns when the points cannot form one.
-//!
-//! One set, and each call reaches only its own tags inside it: `createWorld`
-//! only `WorldLimitReached`, the body, shape and chain creators only
-//! `WorldLocked`, and `computeHull` only `HullNotConvex`. The shared set is the
-//! vocabulary this module speaks in, not a claim that one call has three ways
-//! to fail.
-//!
-//! Upstream's *assertions* are not errors and are not wrapped. A bad definition,
-//! a NaN coordinate or a stale handle trips a `B2_ASSERT`, which aborts in the
-//! library; there is no honest way to turn "you passed something upstream
-//! documents as illegal" into a recoverable Zig error without inventing a
-//! condition upstream does not have. The `*IsValid` functions are the supported
-//! way to ask about a handle, and this module does not wrap them into something
-//! that pretends the answer can be anything else.
-//!
-//! ## Threading
-//!
-//! A world is not thread-safe and belongs to one thread at a time. Upstream does
-//! create no threads (`include/box2d/types.h:120-127`), so `worldStep`'s
-//! `worker_count` in a `WorldDef` is the number of threads *the caller* has
-//! allocated to it, and the task callbacks the world calls back through must be
-//! safe to call from each of those. Different worlds are independent and may be
-//! simulated in parallel (`include/box2d/box2d.h:24-26`).
+//! Import as `@import("box2d")`; `c` exposes the translated header.
+//! Definitions and geometry are borrowed for each call; event slices borrow
+//! world storage until its next step or destruction.
+//! Creation errors use `CreateError`; upstream assertions still abort.
+//! See `README.zig.md` for configuration details.
 
 const std = @import("std");
 
-/// The translated Box2D header, i.e. upstream's ABI exactly as published.
-///
-/// This is the escape hatch for a caller that needs a declaration this facade
-/// does not name and for the struct fields themselves. It is the same module the
-/// facade calls, on the same library, so importing the facade is all a dependent
-/// needs to reach it; it is not published under a name of its own.
-///
-/// The declarations are for whichever header this build selected, and the whole
-/// of it: every `B2_API` entry point in `base.h`, `box2d.h`, `collision.h`,
-/// `id.h`, `math_functions.h` and `types.h` is here, whether or not a function
-/// below wraps it. A caller that reaches past the facade gets upstream behaviour
-/// and inherits every obligation upstream declares.
-///
-/// In a runtime-loading build this module is a generated dispatch instead of the
-/// translation step's own output. It publishes the same namespace: every type and
-/// constant is re-exported from the translated header rather than restated, so
-/// `WorldId` is the same nominal type either way and nothing here needs a cast.
-/// What differs is how a name reaches the library. In the linked configuration it
-/// is a direct call; in the runtime-loaded one it is a call through a table that
-/// `load` fills, and a call before that fill stops the program with a message
-/// naming the function. `runtime_loaded` says which configuration this is, at
-/// comptime.
+/// The translated Box2D API, or a dispatch with the same declarations in runtime-loaded builds.
+/// Calls follow upstream behavior; declarations not wrapped below remain accessible here.
 pub const c = @import("c");
 
-/// The loader core, which is where a linked build's two public types come from.
-///
-/// It is imported only by the linked configuration. In a runtime-loading build
-/// the dispatch carries its own copy of the same declarations, and this module is
-/// never referenced, so it is never resolved and never compiled. Either way
-/// there is exactly one `LoadSource` and one `LoadError` in a build, which is
-/// what keeps them one type for a consumer that names them.
+/// Loader definitions used by the linked configuration.
 const rt = @import("rt");
 
-/// Whether this module was configured to resolve its native symbols at run
-/// time.
-///
-/// False for the ordinary build, where the C library is linked and `c` is the
-/// translated header itself. True when the build generated a dispatch that
-/// resolves the same symbols through the platform loader, in which case `load`
-/// is the call that makes the library usable.
-///
-/// It is a comptime constant, so a consumer can write two different code paths
-/// and have only the one it chose analyzed.
+/// Whether symbols resolve through the platform loader at runtime.
+/// Comptime false means linked; true means `load` must run before other calls.
 pub const runtime_loaded: bool = if (@hasDecl(c, "rt_runtime_loaded")) c.rt_runtime_loaded else false;
 
-/// Which native library `load` should open.
-///
-/// `.path` is an explicit file path and `.system` is an explicit name for the
-/// platform loader. There is no path-to-system fallback and no implicit fallback
-/// of any kind; a request that cannot be honoured is an error, not a different
-/// library.
+/// Selects an explicit file path or platform library name for `load`.
+/// Neither source falls back to the other.
 pub const LoadSource = if (runtime_loaded) c.LoadSource else rt.LoadSource;
 
-/// Every way `load` can decline.
-///
-/// Declared here, in the module a consumer imports, rather than only inside the
-/// loader: the caller names the failure it is handling.
+/// Errors returned while loading the native library.
 pub const LoadError = if (runtime_loaded) c.LoadError else rt.LoadError;
 
-/// Load the native library this module dispatches to.
-///
-/// In a runtime-loading build this is the whole contract: call it once, then use
-/// this module as if it were linked. Calling it again with the same request
-/// succeeds and changes nothing; calling it with a different request after a
-/// success is `ProviderMismatch`, and the library already in use stays in use. A
-/// failed attempt publishes nothing and can be retried explicitly, by calling
-/// this again: there is no automatic retry, and no implicit second source.
-///
-/// It keeps the process handle and its own copy of the request to the end of the
-/// process. There is no unload and no reset, because the table is process-global
-/// state that other code may already have called through.
-///
-/// Safe to call from any thread. A thread that arrives while an attempt for the
-/// same request is in flight waits for that attempt and gets its result, whatever
-/// it was. A call from the thread that is running the attempt is
-/// `ReentrantLoad` rather than a deadlock.
-///
-/// In a linked build there is no provider, no table and nothing to resolve, so
-/// this stops the program with a message saying so instead of quietly succeeding.
-/// `runtime_loaded` is false there, so a consumer that supports both
-/// configurations can tell the two apart at comptime instead of meeting this at
-/// run time.
+/// Loads the selected provider once and retains its handle until process exit.
+/// Returns `LoadError` on failure or provider mismatch; same-request calls wait, reentrant calls fail, and linked builds panic.
 pub fn load(source: LoadSource) LoadError!void {
     if (comptime !runtime_loaded) {
         std.debug.panic(
@@ -291,46 +42,24 @@ pub fn load(source: LoadSource) LoadError!void {
     return c.load(source);
 }
 
-/// The request that succeeded, or null when nothing has loaded yet.
-///
-/// The answer is the loader's own retained copy and stays valid for the life of
-/// the process. Null in a linked build, which has no request.
+/// Returns the successful request, or null before loading and in linked builds.
 pub fn loadedSource() ?LoadSource {
     if (comptime !runtime_loaded) return null;
     return c.loadedSource();
 }
 
-/// Every way a creation in this module declines.
-///
-/// One error per way a creation call here declines — a null handle upstream
-/// returns, or the zero-count hull `computeHull` reports — and nothing else.
-/// This is the one vocabulary every creation call speaks in; each call reaches
-/// only the tags its own check can produce. See the module documentation for
-/// where each one comes from.
+/// Errors returned by creation helpers when upstream refuses a request.
+/// Each helper can return only the tag produced by its own refusal check.
 pub const CreateError = error{
-    /// All `B2_MAX_WORLDS` world slots are in use. Upstream returns a null
-    /// `b2WorldId` rather than failing visibly (`src/world.c:115-118`).
+    /// No world slots remain (`B2_MAX_WORLDS`).
     WorldLimitReached,
-    /// The world is locked, which is what a world is while a step or a callback
-    /// is running. Upstream returns a null body, shape or chain id
-    /// (`src/body.c:192-195`, `src/shape.c:172-176`, `src/shape.c:345-349`).
-    /// `createSegmentShape` also returns this for a segment upstream refuses as
-    /// degenerate (`src/shape.c:219-224`), which is a second null id the
-    /// wrapper cannot distinguish from the locked case.
+    /// The world is locked or a segment is degenerate; upstream returns a null id for either.
     WorldLocked,
-    /// `computeHull` could not build a convex hull from the points, which it
-    /// reports as a hull whose `count` is zero (`src/hull.c:89-96`).
+    /// The points do not form a convex hull.
     HullNotConvex,
 };
 
-// ---------------------------------------------------------------------------
-// Constants read out of the headers
-// ---------------------------------------------------------------------------
-
-/// The maximum number of vertices on a convex polygon, `B2_MAX_POLYGON_VERTICES`
-/// (`include/box2d/collision.h:24`). Changing it changes `Polygon`'s two vertex
-/// arrays and `ShapeProxy`'s point array, so it is a build-time choice upstream
-/// makes and this build reports rather than one a caller makes.
+/// Maximum vertices in a convex polygon, fixed by upstream's `B2_MAX_POLYGON_VERTICES`.
 pub const max_polygon_vertices: usize = c.B2_MAX_POLYGON_VERTICES;
 
 /// The default collision category bits, `B2_DEFAULT_CATEGORY_BITS`
@@ -341,11 +70,7 @@ pub const default_category_bits: u64 = c.B2_DEFAULT_CATEGORY_BITS;
 /// (`include/box2d/types.h:15`): every category.
 pub const default_mask_bits: u64 = c.B2_DEFAULT_MASK_BITS;
 
-/// Pi as Box2D spells it, `B2_PI` (`include/box2d/math_functions.h:79`).
-///
-/// This is upstream's constant, which is deliberately shorter than a `f64` pi:
-/// Box2D only ever uses it to build angular frequencies, and a longer literal
-/// would make two builds disagree about the last bit of a hertz value.
+/// Box2D's `B2_PI` constant.
 pub const pi: f32 = c.B2_PI;
 
 /// The seed upstream's own determinism hash starts from, `B2_HASH_INIT`
@@ -361,17 +86,7 @@ pub const rot_identity: Rot = c.b2Rot_identity;
 /// `b2Transform_identity` (`include/box2d/math_functions.h:83`).
 pub const transform_identity: Transform = c.b2Transform_identity;
 
-// ---------------------------------------------------------------------------
-// Handles
-// ---------------------------------------------------------------------------
-
-/// A world handle, `b2WorldId` (`include/box2d/id.h:37`).
-///
-/// Upstream's comment is the whole contract: "World id references a world
-/// instance. This should be treated as an opaque handle." The two fields are
-/// reachable in Zig, and reaching them is how a caller gets in trouble; treat a
-/// `WorldId` as a value to pass back, not a struct to edit. `worldIsValid` is the
-/// supported question to ask about one.
+/// Opaque handle to a world. Pass it back unchanged; use `worldIsValid` to check it.
 pub const WorldId = c.b2WorldId;
 
 /// A body handle, `b2BodyId` (`include/box2d/id.h:44`).
@@ -401,24 +116,12 @@ pub const null_chain_id: ChainId = c.b2_nullChainId;
 /// `b2_nullJointId` (`include/box2d/id.h:81`).
 pub const null_joint_id: JointId = c.b2_nullJointId;
 
-/// Whether any handle is null, `B2_IS_NULL` (`include/box2d/id.h:84`).
-///
-/// An all-zero handle of any of the five kinds. `createWorld` and friends return
-/// exactly this when they decline, which is why `CreateError` exists rather than
-/// a null test at every call site.
+/// Tests whether a handle is null.
 pub fn isNullId(id: anytype) bool {
     return id.index1 == 0;
 }
 
-/// Whether two handles of the same kind are the same handle, `B2_ID_EQUALS`
-/// (`include/box2d/id.h:90`).
-///
-/// Upstream's comment says this does not work for `b2WorldId`, and it does not
-/// work here either: a world id's fields are the slot index and the world
-/// generation, while a body id's are the body index, the world slot and the body
-/// generation. Comparing two body ids field by field is right; comparing two
-/// world ids with it is not, and neither is comparing handles of different
-/// kinds. `isNullId` is the only kind-agnostic question here.
+/// Compares handle fields. Use only with body, shape, chain or joint ids, not world ids.
 pub fn idsEqual(a: anytype, b: anytype) bool {
     return a.index1 == b.index1 and a.world0 == b.world0 and a.generation == b.generation;
 }
@@ -473,10 +176,6 @@ pub fn loadJointId(x: u64) JointId {
     return c.b2LoadJointId(x);
 }
 
-// ---------------------------------------------------------------------------
-// Value types, exactly as upstream declares them
-// ---------------------------------------------------------------------------
-
 /// `b2Vec2` (`include/box2d/math_functions.h:20`). Two `f32`, so its layout is
 /// the platform's scalar width and nothing else.
 pub const Vec2 = c.b2Vec2;
@@ -484,9 +183,7 @@ pub const Vec2 = c.b2Vec2;
 /// `b2CosSin` (`include/box2d/math_functions.h:28`).
 pub const CosSin = c.b2CosSin;
 
-/// `b2Rot` (`include/box2d/math_functions.h:37`): a cosine and a sine, not an
-/// angle. This is what makes rotation arithmetic a complex multiply and what
-/// makes Box2D's rotation bit-for-bit reproducible.
+/// A rotation stored as cosine and sine, `b2Rot`.
 pub const Rot = c.b2Rot;
 
 /// `b2Transform` (`include/box2d/math_functions.h:44`).
@@ -525,24 +222,16 @@ pub const Circle = c.b2Circle;
 /// `b2Capsule` (`include/box2d/collision.h:115`).
 pub const Capsule = c.b2Capsule;
 
-/// `b2Polygon` (`include/box2d/collision.h:133`).
-///
-/// Upstream warns against filling this out by hand: the `normals` array and the
-/// `centroid` are derived, and a polygon whose fields disagree is not a polygon
-/// any of these functions can use. Build one with `makeBox`, `makePolygon`,
-/// `makeSquare`, `makeRoundedBox`, `makeOffsetBox` or `transformPolygon`.
+/// `b2Polygon`; build valid values with the polygon helpers.
 pub const Polygon = c.b2Polygon;
 
 /// `b2Segment` (`include/box2d/collision.h:152`): a two-sided line segment.
 pub const Segment = c.b2Segment;
 
-/// `b2ChainSegment` (`include/box2d/collision.h:164`): a one-sided segment
-/// owned by a chain shape, with the two ghost vertices that make the chain
-/// continuous.
+/// One-sided segment with ghost vertices, owned by a chain shape.
 pub const ChainSegment = c.b2ChainSegment;
 
-/// `b2Hull` (`include/box2d/collision.h:284`). Only `computeHull` may build one;
-/// `makePolygon` asserts if it is handed something else.
+/// Convex hull built by `computeHull`; `makePolygon` asserts on invalid hulls.
 pub const Hull = c.b2Hull;
 
 /// `b2SegmentDistanceResult` (`include/box2d/collision.h:322`).
@@ -584,13 +273,7 @@ pub const ManifoldPoint = c.b2ManifoldPoint;
 /// `b2Manifold` (`include/box2d/collision.h:538`).
 pub const Manifold = c.b2Manifold;
 
-/// `b2DynamicTree` (`include/box2d/collision.h:621`).
-///
-/// Upstream calls this "private data ... placed here for performance reasons",
-/// and that is a real constraint rather than modesty: it holds pointers to
-/// upstream's own node pool and its five rebuild scratch arrays. Create one with
-/// `dynamicTreeCreate` and destroy it with `dynamicTreeDestroy`; nothing else in
-/// the header allocates or frees the memory it points at.
+/// Dynamic-tree storage. Create with `dynamicTreeCreate` and destroy once with `dynamicTreeDestroy`.
 pub const DynamicTree = c.b2DynamicTree;
 
 /// `b2TreeStats` (`include/box2d/collision.h:658`).
@@ -605,12 +288,7 @@ pub const CollisionPlane = c.b2CollisionPlane;
 /// `b2PlaneSolverResult` (`include/box2d/collision.h:814`).
 pub const PlaneSolverResult = c.b2PlaneSolverResult;
 
-/// `b2WorldDef` (`include/box2d/types.h:81`).
-///
-/// The `internalValue` field is upstream's own validity stamp
-/// (`include/box2d/types.h:141-142`): `b2DefaultWorldDef` sets it and
-/// `B2_CHECK_DEF` asserts on it, which is why a definition must come from
-/// `defaultWorldDef` rather than from a zeroed struct.
+/// World definition. Obtain a valid value from `defaultWorldDef`; zeroed values fail upstream checks.
 pub const WorldDef = c.b2WorldDef;
 
 /// `b2BodyType` (`include/box2d/types.h:152`).
@@ -634,11 +312,7 @@ pub const SurfaceMaterial = c.b2SurfaceMaterial;
 /// `b2ShapeDef` (`include/box2d/types.h:362`).
 pub const ShapeDef = c.b2ShapeDef;
 
-/// `b2ChainDef` (`include/box2d/types.h:429`).
-///
-/// `points` and `materials` are cloned by `createChain`, so they may be
-/// temporaries. `count` must be at least four and `material_count` must be one or
-/// `count`; both are asserted, not checked.
+/// Chain definition. `createChain` clones `points` and `materials`; invalid counts assert.
 pub const ChainDef = c.b2ChainDef;
 
 /// `b2Profile` (`include/box2d/types.h:466`): per-stage timings in
@@ -681,12 +355,7 @@ pub const ExplosionDef = c.b2ExplosionDef;
 /// `b2SensorBeginTouchEvent` (`include/box2d/types.h:1004`).
 pub const SensorBeginTouchEvent = c.b2SensorBeginTouchEvent;
 
-/// `b2SensorEndTouchEvent` (`include/box2d/types.h:1017`).
-///
-/// Both shape ids here may already name destroyed shapes: upstream says so at
-/// `include/box2d/types.h:1015-1016` and says to confirm with
-/// `b2Shape_IsValid`. That is the whole reason the event slices below are
-/// borrowed rather than copied into something that looks permanent.
+/// Sensor end event; either shape id may already be invalid.
 pub const SensorEndTouchEvent = c.b2SensorEndTouchEvent;
 
 /// `b2SensorEvents` (`include/box2d/types.h:1034`).
@@ -695,9 +364,7 @@ pub const SensorEvents = c.b2SensorEvents;
 /// `b2ContactBeginTouchEvent` (`include/box2d/types.h:1050`).
 pub const ContactBeginTouchEvent = c.b2ContactBeginTouchEvent;
 
-/// `b2ContactEndTouchEvent` (`include/box2d/types.h:1067`).
-///
-/// As for a sensor end event, either shape may already be destroyed.
+/// Contact end event; either shape id may already be invalid.
 pub const ContactEndTouchEvent = c.b2ContactEndTouchEvent;
 
 /// `b2ContactHitEvent` (`include/box2d/types.h:1082`).
@@ -715,12 +382,7 @@ pub const BodyEvents = c.b2BodyEvents;
 /// `b2ContactData` (`include/box2d/types.h:1159`).
 pub const ContactData = c.b2ContactData;
 
-/// `b2DebugDraw` (`include/box2d/types.h:1383`).
-///
-/// A struct of function pointers the *caller* fills, which Box2D calls back
-/// through from `worldDraw`. Upstream says it "should be zero initialized", and
-/// `defaultDebugDraw` is how: it sets the drawing bounds and leaves every
-/// callback null, so `worldDraw` draws nothing until a callback is installed.
+/// Callback table used by `worldDraw`; initialize with `defaultDebugDraw`.
 pub const DebugDraw = c.b2DebugDraw;
 
 /// `b2RayResult` (`include/box2d/types.h:67`).
@@ -728,10 +390,6 @@ pub const RayResult = c.b2RayResult;
 
 /// `b2HexColor` (`include/box2d/types.h:1230`).
 pub const HexColor = c.b2HexColor;
-
-// ---------------------------------------------------------------------------
-// Callbacks, aliased rather than restated
-// ---------------------------------------------------------------------------
 
 /// `b2AllocFcn` (`include/box2d/base.h:49`).
 pub const AllocFcn = c.b2AllocFcn;
@@ -751,10 +409,7 @@ pub const EnqueueTaskCallback = c.b2EnqueueTaskCallback;
 /// `b2FinishTaskCallback` (`include/box2d/types.h:50`).
 pub const FinishTaskCallback = c.b2FinishTaskCallback;
 
-/// `b2FrictionCallback` (`include/box2d/types.h:56`).
-///
-/// Called from a worker thread during the solve, so it must not touch Box2D or
-/// application state (`include/box2d/types.h:53-55`).
+/// Called during solving on worker threads; avoid accessing Box2D or application state.
 pub const FrictionCallback = c.b2FrictionCallback;
 
 /// `b2RestitutionCallback` (`include/box2d/types.h:62`).
@@ -764,18 +419,15 @@ pub const RestitutionCallback = c.b2RestitutionCallback;
 /// the collision.
 pub const CustomFilterFn = c.b2CustomFilterFcn;
 
-/// `b2PreSolveFcn` (`include/box2d/types.h:1195`). Return false to skip the
-/// contact this step. Not called for sensors, and called only for shapes with
-/// pre-solve events enabled.
+/// Pre-solve callback; return false to skip this step's contact. Sensors are excluded.
 pub const PreSolveFn = c.b2PreSolveFcn;
 
 /// `b2OverlapResultFcn` (`include/box2d/types.h:1202`). Return false to stop
 /// the query.
 pub const OverlapResultFn = c.b2OverlapResultFcn;
 
-/// `b2CastResultFcn` (`include/box2d/types.h:1220`). Return `-1` to ignore the
-/// shape, `0` to stop, a fraction to clip the ray there, `1` to continue
-/// unclipped.
+/// `b2CastResultFcn` (`include/box2d/types.h:1220`): return `-1` to ignore, `0` to stop,
+/// `1` to continue, or a fraction to clip the ray.
 pub const CastResultFn = c.b2CastResultFcn;
 
 /// `b2PlaneResultFcn` (`include/box2d/types.h:1224`).
@@ -792,47 +444,29 @@ pub const TreeRayCastCallbackFn = c.b2TreeRayCastCallbackFcn;
 /// `b2TreeShapeCastCallbackFcn` (`include/box2d/collision.h:728`).
 pub const TreeShapeCastCallbackFn = c.b2TreeShapeCastCallbackFcn;
 
-// ---------------------------------------------------------------------------
-// Base: version, allocation, timing, hashing
-// ---------------------------------------------------------------------------
-
-/// `b2GetVersion` (`include/box2d/base.h:84`).
-///
-/// The library that got linked, not a constant compiled into a program: in a
-/// runtime-loading build this is the provider's own answer.
+/// `b2GetVersion` (`include/box2d/base.h:84`) returns the active native library's version.
 pub fn getVersion() Version {
     return c.b2GetVersion();
 }
 
-/// `b2SetAllocator` (`include/box2d/base.h:60`).
-///
-/// Upstream says these should be set during application startup. Both are
-/// borrowed, not retained: `setAllocator` stores the pair and every later
-/// allocation goes through it, so the two functions must stay valid for the life
-/// of the process. Passing null restores upstream's own allocator.
+/// Sets process-wide allocator callbacks; both pointers are retained and must remain valid for process lifetime.
+/// Passing null restores Box2D's allocator.
 pub fn setAllocator(alloc: ?*const AllocFcn, free: ?*const FreeFcn) void {
     c.b2SetAllocator(alloc, free);
 }
 
-/// `b2GetByteCount` (`include/box2d/base.h:63`).
-///
-/// Bytes Box2D has allocated, over the whole process. Useful for a leak check;
-/// not a count of anything a caller owns.
+/// Returns the process-wide number of bytes allocated by Box2D.
 pub fn getByteCount() c_int {
     return c.b2GetByteCount();
 }
 
-/// `b2SetAssertFcn` (`include/box2d/base.h:67`).
-///
-/// Upstream wants a non-null callback. The callback runs inside a `B2_ASSERT`
-/// and must not return; return zero to skip the debugger break
-/// (`include/box2d/base.h:55`).
+/// Sets the assertion callback; upstream requires it to be non-null and not return.
+/// Return zero to skip the debugger break.
 pub fn setAssertFcn(fcn: ?*const AssertFcn) void {
     c.b2SetAssertFcn(fcn);
 }
 
-/// `b2GetTicks` (`include/box2d/base.h:115`). Platform specific, and not
-/// comparable with another platform's value.
+/// Returns platform-specific ticks, which are not portable across platforms.
 pub fn getTicks() u64 {
     return c.b2GetTicks();
 }
@@ -842,39 +476,22 @@ pub fn getMilliseconds(ticks: u64) f32 {
     return c.b2GetMilliseconds(ticks);
 }
 
-/// `b2GetMillisecondsAndReset` (`include/box2d/base.h:122`).
-///
-/// `ticks` is updated to the current tick value, so the same slot can be reused
-/// for the next interval.
+/// Converts ticks to milliseconds and updates `ticks` to the current tick value.
 pub fn getMillisecondsAndReset(ticks: *u64) f32 {
     return c.b2GetMillisecondsAndReset(ticks);
 }
 
-/// `b2Yield` (`include/box2d/base.h:125`). For a busy loop that must not starve
-/// the rest of the process.
+/// Yields to avoid starving the process in a busy loop.
 pub fn yield() void {
     c.b2Yield();
 }
 
-/// `b2Hash` (`include/box2d/base.h:130`).
-///
-/// Upstream's djb2, for determinism testing (`include/box2d/base.h:127`). It is
-/// a rolling hash: the result of one call is the seed for the next, which is how
-/// upstream detects that two runs of the same input produced different bytes.
+/// Computes Box2D's rolling djb2 hash; pass each result as the next seed.
 pub fn hash(seed: u32, data: []const u8) u32 {
     return c.b2Hash(seed, data.ptr, @intCast(data.len));
 }
 
-// ---------------------------------------------------------------------------
-// Upstream's default definitions
-// ---------------------------------------------------------------------------
-
-/// `b2DefaultWorldDef` (`include/box2d/types.h:147`).
-///
-/// Every definition in this group must come from its `b2Default*` function:
-/// each one carries an `internalValue` stamp that upstream's `B2_CHECK_DEF`
-/// checks, so a zeroed or hand-written definition trips an assert rather than
-/// being rejected with an error.
+/// Returns an initialized world definition; use the matching helper for other definitions.
 pub fn defaultWorldDef() WorldDef {
     return c.b2DefaultWorldDef();
 }
@@ -959,26 +576,12 @@ pub fn defaultDebugDraw() DebugDraw {
     return c.b2DefaultDebugDraw();
 }
 
-// ---------------------------------------------------------------------------
-// Math
-// ---------------------------------------------------------------------------
-
-/// A vector literal, for the `b2Vec2` field a definition asks for.
-///
-/// This is the struct's own construction and not a call: `Vec2` is two `f32`
-/// (`include/box2d/math_functions.h:20`) and this writes them. Upstream's own
-/// equivalent spelling is the compound literal `(b2Vec2){ x, y }` that
-/// `include/box2d/base.h:34-35` exists to support in C.
+/// Constructs a vector from its components.
 pub fn vec2(x: f32, y: f32) Vec2 {
     return .{ .x = x, .y = y };
 }
 
-/// `b2MakeRot` (`include/box2d/math_functions.h:370`).
-///
-/// Upstream computes this with its own deterministic trigonometric pair rather
-/// than the platform's `sinf`/`cosf`, which is why this forwards to it instead
-/// of writing `@sin` and `@cos` here: a rotation built any other way can differ
-/// in the last bit, and that difference becomes a different simulation.
+/// Constructs a rotation from radians using Box2D's deterministic trigonometry.
 pub fn makeRot(radians: f32) Rot {
     return c.b2MakeRot(radians);
 }
@@ -1108,11 +711,7 @@ pub fn distanceSquared(a: Vec2, b: Vec2) f32 {
     return c.b2DistanceSquared(a, b);
 }
 
-/// `b2Normalize` (`include/box2d/math_functions.h:296`).
-///
-/// Returns the zero vector for a zero-length input rather than a NaN, which is
-/// what makes it safe to call on a computed direction without a length test
-/// first.
+/// Normalizes a vector, returning zero for zero-length input.
 pub fn normalize(v: Vec2) Vec2 {
     return c.b2Normalize(v);
 }
@@ -1122,20 +721,14 @@ pub fn isNormalized(a: Vec2) bool {
     return c.b2IsNormalized(a);
 }
 
-/// `b2GetLengthAndNormalize` (`include/box2d/math_functions.h:318`).
-///
-/// Upstream takes an out-parameter for the length and returns the direction, so
-/// one call does both. That pair is what a caller almost always wants, and this
-/// returns it as a value; `length` is the original length and `direction` is
-/// `v` scaled to unit length, or zero when `v` was zero.
+/// Returns the original length and normalized direction; zero input yields zero direction.
 pub fn getLengthAndNormalize(v: Vec2) LengthAndDirection {
     var magnitude: f32 = 0;
     const direction = c.b2GetLengthAndNormalize(&magnitude, v);
     return .{ .length = magnitude, .direction = direction };
 }
 
-/// What `getLengthAndNormalize` answers: the original length and the unit
-/// direction, from the one out-parameter pair upstream splits.
+/// Length and direction returned by `getLengthAndNormalize`.
 pub const LengthAndDirection = struct {
     /// The length `v` had before it was scaled.
     length: f32,
@@ -1163,8 +756,7 @@ pub fn computeAngularVelocity(q1: Rot, q2: Rot, inv_h: f32) f32 {
     return c.b2ComputeAngularVelocity(q1, q2, inv_h);
 }
 
-/// `b2Rot_GetAngle` (`include/box2d/math_functions.h:425`). Unwrapped to
-/// `[-pi, pi]`.
+/// Returns the wrapped angle in `[-pi, pi]`.
 pub fn rotAngle(q: Rot) f32 {
     return c.b2Rot_GetAngle(q);
 }
@@ -1269,28 +861,8 @@ pub fn aabbOverlaps(a: Aabb, b: Aabb) bool {
     return c.b2AABB_Overlaps(a, b);
 }
 
-/// `b2MakeAABB` (`include/box2d/math_functions.h:625`).
-///
-/// The bounding box of `points`, grown by `radius` on every side.
-///
-/// `points` must not be empty, and that is a precondition this module neither
-/// checks nor turns into an error. The native body opens with
-/// `B2_ASSERT( count > 0 )` (`include/box2d/math_functions.h:627`), which says
-/// the caller's state is valid, and the line after it reads `points[0]`
-/// unconditionally. So `count == 0` has no answer to return -- inverted box or
-/// otherwise -- and this module adds no second, quieter contract to stand in
-/// for one the header does not make. An empty slice is the caller's mistake
-/// rather than a value the library can be asked about, and upstream's
-/// assertion is where that is said.
-///
-/// This is the one function on the translated surface declared `B2_INLINE`
-/// rather than `B2_API` (`include/box2d/base.h:33` makes that `static inline`
-/// in C), so the header emits no symbol for it. The C definition this call
-/// resolves to is `build_support/box2d_inline_bridge.c`, which compiles that
-/// same header body rather than restating it, so `c.b2MakeAABB` and this
-/// function are one ABI reached through one symbol: calling either lands on
-/// the same code. Under `-Druntime=true` that symbol is the loaded provider's
-/// export rather than the archive's, and nothing else about the call changes.
+/// Returns the bounds of `points`, expanded by `radius`; `points` must be non-empty.
+/// Upstream asserts on an empty slice.
 pub fn makeAabb(points: []const Vec2, radius: f32) Aabb {
     return c.b2MakeAABB(points.ptr, @intCast(points.len), radius);
 }
@@ -1300,12 +872,7 @@ pub fn planeSeparation(plane: Plane, point: Vec2) f32 {
     return c.b2PlaneSeparation(plane, point);
 }
 
-/// `b2SpringDamper` (`include/box2d/math_functions.h:653`).
-///
-/// The new velocity for a one-dimensional mass-spring-damper, to be followed by
-/// `position += time_step * new_velocity`. This is the function every joint's
-/// spring runs through, which is why it is exposed rather than left inside the
-/// solver.
+/// Computes the next velocity for a one-dimensional mass-spring-damper.
 pub fn springDamper(hertz: f32, damping_ratio: f32, position: f32, velocity: f32, time_step: f32) f32 {
     return c.b2SpringDamper(hertz, damping_ratio, position, velocity, time_step);
 }
@@ -1350,12 +917,8 @@ pub fn clampFloat(a: f32, lower: f32, upper: f32) f32 {
     return c.b2ClampFloat(a, lower, upper);
 }
 
-/// `b2SetLengthUnitsPerMeter` (`include/box2d/math_functions.h:674`).
-///
-/// Upstream warns this must be called before any other Box2D call and only once:
-/// it scales internal tolerances, so a world created before it and stepped after
-/// it is tuned for the wrong units. Box2D does no scaling of its own, so every
-/// length a caller sends and every length it gets back is in the units set here.
+/// Sets Box2D's length units per meter; call once before any other Box2D function.
+/// The selected unit applies to every input and output length.
 pub fn setLengthUnitsPerMeter(length_units: f32) void {
     c.b2SetLengthUnitsPerMeter(length_units);
 }
@@ -1393,14 +956,7 @@ pub fn isValidPlane(a: Plane) bool {
     return c.b2IsValidPlane(a);
 }
 
-// ---------------------------------------------------------------------------
-// Geometry
-// ---------------------------------------------------------------------------
-
-/// `b2MakePolygon` (`include/box2d/collision.h:184`).
-///
-/// `hull` must come from `computeHull`: upstream asserts on anything else
-/// (`include/box2d/collision.h:182`).
+/// Builds a polygon from a hull returned by `computeHull`; upstream asserts on invalid hulls.
 pub fn makePolygon(hull: *const Hull, radius: f32) Polygon {
     return c.b2MakePolygon(hull, radius);
 }
@@ -1430,11 +986,7 @@ pub fn makeRoundedBox(half_width: f32, half_height: f32, radius: f32) Polygon {
     return c.b2MakeRoundedBox(half_width, half_height, radius);
 }
 
-/// `b2MakeOffsetBox` (`include/box2d/collision.h:214`).
-///
-/// A box that is already where it belongs, so a caller does not have to create
-/// a body at the origin and move it afterwards, which upstream says nearly
-/// doubles the cost of body creation (`include/box2d/types.h:178-179`).
+/// Builds a box at `center` with the given rotation, avoiding a later body move.
 pub fn makeOffsetBox(half_width: f32, half_height: f32, center: Vec2, rotation: Rot) Polygon {
     return c.b2MakeOffsetBox(half_width, half_height, center, rotation);
 }
@@ -1455,10 +1007,7 @@ pub fn transformPolygon(transform: Transform, polygon: *const Polygon) Polygon {
     return c.b2TransformPolygon(transform, polygon);
 }
 
-/// `b2MakeProxy` (`include/box2d/collision.h:432`).
-///
-/// A deep copy of at most `max_polygon_vertices` points, for the query and shape
-/// cast entry points that take a proxy.
+/// Copies up to `max_polygon_vertices` points into a query or shape-cast proxy.
 pub fn makeProxy(points: []const Vec2, radius: f32) ShapeProxy {
     return c.b2MakeProxy(points.ptr, @intCast(points.len), radius);
 }
@@ -1468,25 +1017,15 @@ pub fn makeOffsetProxy(points: []const Vec2, radius: f32, position: Vec2, rotati
     return c.b2MakeOffsetProxy(points.ptr, @intCast(points.len), radius, position, rotation);
 }
 
-/// `b2ComputeHull` (`include/box2d/collision.h:301`).
-///
-/// Upstream returns a hull whose `count` is zero rather than failing visibly,
-/// which is what `HullNotConvex` reports. Fewer than three points or more than
-/// `max_polygon_vertices`, and any set that is not convex with distinct points,
-/// all land there (`src/hull.c:92-96`).
-///
-/// `HullNotConvex` is the only tag in `CreateError` this function can reach:
-/// `b2ComputeHull` returns a `b2Hull` by value and has no null handle to
-/// refuse with, so the wider set is the shared vocabulary and not three ways
-/// this one call can fail.
+/// Computes a convex hull.
+/// Returns `HullNotConvex` when the points cannot form one.
 pub fn computeHull(points: []const Vec2) CreateError!Hull {
     const hull = c.b2ComputeHull(points.ptr, @intCast(points.len));
     if (hull.count == 0) return error.HullNotConvex;
     return hull;
 }
 
-/// `b2ValidateHull` (`include/box2d/collision.h:307`): whether a hull is one
-/// `b2MakePolygon` would accept, for a caller that built one by other means.
+/// Checks whether `hull` is valid for `makePolygon`.
 pub fn validateHull(hull: *const Hull) bool {
     return c.b2ValidateHull(hull);
 }
@@ -1556,10 +1095,7 @@ pub fn rayCastCapsule(input: *const RayCastInput, shape: *const Capsule) CastOut
     return c.b2RayCastCapsule(input, shape);
 }
 
-/// `b2RayCastSegment` (`include/box2d/collision.h:265`).
-///
-/// `one_sided` matches a chain segment's collision behaviour: only the right
-/// side of `p1 -> p2` is solid.
+/// Casts a ray against a segment; `one_sided` makes only the right side solid.
 pub fn rayCastSegment(input: *const RayCastInput, shape: *const Segment, one_sided: bool) CastOutput {
     return c.b2RayCastSegment(input, shape, one_sided);
 }
@@ -1595,12 +1131,8 @@ pub fn segmentDistance(p1: Vec2, q1: Vec2, p2: Vec2, q2: Vec2) SegmentDistanceRe
     return c.b2SegmentDistance(p1, q1, p2, q2);
 }
 
-/// `b2ShapeDistance` (`include/box2d/collision.h:412`).
-///
-/// GJK. `cache` is both input and output: upstream says to zero its `count` on
-/// the first call (`include/box2d/collision.h:410`). `simplexes` and
-/// `simplex_capacity` are for debugging and may be an empty slice with a zero
-/// capacity.
+/// Computes GJK distance; zero `cache.count` before the first call.
+/// `cache` is updated; `simplexes` is optional debug output.
 pub fn shapeDistance(
     input: *const DistanceInput,
     cache: *SimplexCache,
@@ -1620,12 +1152,7 @@ pub fn getSweepTransform(sweep: *const Sweep, time: f32) Transform {
     return c.b2GetSweepTransform(sweep, time);
 }
 
-/// `b2TimeOfImpact` (`include/box2d/collision.h:483`).
-///
-/// An upper bound on the time before two swept shapes penetrate, as a fraction
-/// of `input.maxFraction`. Upstream warns it may miss intermediate
-/// non-tunnelling collisions and that the answer is only valid for the interval
-/// it was given (`include/box2d/collision.h:479-482`).
+/// Estimates the first impact fraction within `maxFraction`; intermediate non-tunneling collisions may be missed.
 pub fn timeOfImpact(input: *const TOIInput) TOIOutput {
     return c.b2TimeOfImpact(input);
 }
@@ -1715,16 +1242,7 @@ pub fn collideChainSegmentAndCircle(
     return c.b2CollideChainSegmentAndCircle(a, xf_a, b, xf_b);
 }
 
-/// `b2CollideChainSegmentAndCapsule` (`include/box2d/collision.h:592`).
-///
-/// Upstream's fifth argument is the caller's `b2SimplexCache*`, which its GJK
-/// solve fills and reads back on the next call for the same pair
-/// (`src/manifold.c:1385`). Upstream says a caller should generally
-/// zero-initialize that structure for each call
-/// (`include/box2d/collision.h:346`), which is what this does: the manifold is
-/// the same answer, without the warm start a cache carried across calls would
-/// give. `shapeDistance` hands the cache to the caller instead, because there
-/// the caller owns the whole sequence.
+/// Collides a chain segment and capsule, using a zero-initialized simplex cache.
 pub fn collideChainSegmentAndCapsule(
     a: *const ChainSegment,
     xf_a: Transform,
@@ -1735,11 +1253,7 @@ pub fn collideChainSegmentAndCapsule(
     return c.b2CollideChainSegmentAndCapsule(a, xf_a, b, xf_b, &cache);
 }
 
-/// `b2CollideChainSegmentAndPolygon` (`include/box2d/collision.h:596`).
-///
-/// The caller-owned `b2SimplexCache*` upstream takes here is zero-initialized
-/// for each call, as `include/box2d/collision.h:346` directs and
-/// `collideChainSegmentAndCapsule` above explains.
+/// Collides a chain segment and polygon, using a zero-initialized simplex cache.
 pub fn collideChainSegmentAndPolygon(
     a: *const ChainSegment,
     xf_a: Transform,
@@ -1750,40 +1264,24 @@ pub fn collideChainSegmentAndPolygon(
     return c.b2CollideChainSegmentAndPolygon(a, xf_a, b, xf_b, &cache);
 }
 
-/// `b2SolvePlanes` (`include/box2d/collision.h:827`).
-///
-/// Solves for the translation of a character mover that satisfies every plane.
-/// `planes` is **mutated**: upstream writes each plane's `push`, so the same
-/// buffer is the input and part of the output.
+/// Solves for a mover translation satisfying all planes.
+/// Mutates `planes` by writing each plane's `push` value.
 pub fn solvePlanes(target_delta: Vec2, planes: []CollisionPlane) PlaneSolverResult {
     return c.b2SolvePlanes(target_delta, planes.ptr, @intCast(planes.len));
 }
 
-/// `b2ClipVector` (`include/box2d/collision.h:831`).
-///
-/// Clips a velocity against planes whose `push` is non-zero and whose
-/// `clipVelocity` is set.
+/// Clips a vector against planes with non-zero `push` and `clipVelocity`.
 pub fn clipVector(vector: Vec2, planes: []const CollisionPlane) Vec2 {
     return c.b2ClipVector(vector, planes.ptr, @intCast(planes.len));
 }
 
-// ---------------------------------------------------------------------------
-// Dynamic tree
-// ---------------------------------------------------------------------------
-
-/// `b2DynamicTree_Create` (`include/box2d/collision.h:668`).
-///
-/// Returns the tree **by value**. It owns a node pool that `dynamicTreeDestroy`
-/// frees, so a tree must be destroyed exactly once and not copied after use:
-/// the copy and the original would both free the same pool.
+/// Creates a tree that owns a node pool; destroy it exactly once.
+/// Do not copy a tree after use.
 pub fn dynamicTreeCreate() DynamicTree {
     return c.b2DynamicTree_Create();
 }
 
-/// `b2DynamicTree_Destroy` (`include/box2d/collision.h:671`).
-///
-/// Frees the node pool. Every proxy id this tree handed out is stale afterwards,
-/// and the tree itself must not be used again.
+/// Frees the node pool; proxy ids and the tree are invalid afterwards.
 pub fn dynamicTreeDestroy(tree: *DynamicTree) void {
     c.b2DynamicTree_Destroy(tree);
 }
@@ -1793,8 +1291,7 @@ pub fn dynamicTreeCreateProxy(tree: *DynamicTree, aabb: Aabb, category_bits: u64
     return c.b2DynamicTree_CreateProxy(tree, aabb, category_bits, user_data);
 }
 
-/// `b2DynamicTree_DestroyProxy` (`include/box2d/collision.h:677`). Asserts on an
-/// invalid id.
+/// Destroys a proxy; upstream asserts on an invalid id.
 pub fn dynamicTreeDestroyProxy(tree: *DynamicTree, proxy_id: c_int) void {
     c.b2DynamicTree_DestroyProxy(tree, proxy_id);
 }
@@ -1804,16 +1301,12 @@ pub fn dynamicTreeMoveProxy(tree: *DynamicTree, proxy_id: c_int, aabb: Aabb) voi
     c.b2DynamicTree_MoveProxy(tree, proxy_id, aabb);
 }
 
-/// `b2DynamicTree_EnlargeProxy` (`include/box2d/collision.h:683`).
-///
-/// Grows the proxy's box and its ancestors' as needed. Useful for a fast-moving
-/// object that must not be reinserted every step.
+/// Enlarges the proxy and ancestor boxes without reinserting the proxy.
 pub fn dynamicTreeEnlargeProxy(tree: *DynamicTree, proxy_id: c_int, aabb: Aabb) void {
     c.b2DynamicTree_EnlargeProxy(tree, proxy_id, aabb);
 }
 
-/// `b2DynamicTree_SetCategoryBits` (`include/box2d/collision.h:686`). Upstream
-/// notes this is expensive: it reinserts the proxy.
+/// Sets category bits; upstream reinserts the proxy.
 pub fn dynamicTreeSetCategoryBits(tree: *DynamicTree, proxy_id: c_int, category_bits: u64) void {
     c.b2DynamicTree_SetCategoryBits(tree, proxy_id, category_bits);
 }
@@ -1823,8 +1316,7 @@ pub fn dynamicTreeGetCategoryBits(tree: *const DynamicTree, proxy_id: c_int) u64
     return c.b2DynamicTree_GetCategoryBits(tree, proxy_id);
 }
 
-/// `b2DynamicTree_Query` (`include/box2d/collision.h:697`).
-/// `callback` must not be null; see the module documentation.
+/// Queries overlapping proxies; callback must be non-null and context valid for the call.
 pub fn dynamicTreeQuery(
     tree: *const DynamicTree,
     aabb: Aabb,
@@ -1835,12 +1327,8 @@ pub fn dynamicTreeQuery(
     return c.b2DynamicTree_Query(tree, aabb, mask_bits, callback, context);
 }
 
-/// `b2DynamicTree_RayCast` (`include/box2d/collision.h:720`).
-/// `callback` must not be null; see the module documentation.
-///
-/// The callback performs the exact cast for the proxy it is handed; the tree only
-/// narrows the search. Upstream warns that mask-bit filtering here is
-/// approximate and the caller should still filter (`include/box2d/collision.h:712-713`).
+/// Ray-casts candidate proxies; callback must be non-null and perform exact filtering.
+/// Tree mask filtering is approximate.
 pub fn dynamicTreeRayCast(
     tree: *const DynamicTree,
     input: *const RayCastInput,
@@ -1851,8 +1339,7 @@ pub fn dynamicTreeRayCast(
     return c.b2DynamicTree_RayCast(tree, input, mask_bits, callback, context);
 }
 
-/// `b2DynamicTree_ShapeCast` (`include/box2d/collision.h:741`).
-/// `callback` must not be null; see the module documentation.
+/// Shape-casts candidate proxies; callback must be non-null.
 pub fn dynamicTreeShapeCast(
     tree: *const DynamicTree,
     input: *const ShapeCastInput,
@@ -1883,9 +1370,7 @@ pub fn dynamicTreeProxyCount(tree: *const DynamicTree) c_int {
     return c.b2DynamicTree_GetProxyCount(tree);
 }
 
-/// `b2DynamicTree_Rebuild` (`include/box2d/collision.h:757`).
-///
-/// Retains unchanged subtrees and returns the number of boxes sorted.
+/// Rebuilds the tree and returns the number of boxes sorted.
 pub fn dynamicTreeRebuild(tree: *DynamicTree, full_build: bool) c_int {
     return c.b2DynamicTree_Rebuild(tree, full_build);
 }
@@ -1916,85 +1401,43 @@ pub fn dynamicTreeValidateNoEnlarged(tree: *const DynamicTree) void {
     c.b2DynamicTree_ValidateNoEnlarged(tree);
 }
 
-// ---------------------------------------------------------------------------
-// World
-// ---------------------------------------------------------------------------
-
-/// `b2CreateWorld` (`include/box2d/box2d.h:27`).
-///
-/// `def` is read during the call and not retained, so it may be a temporary
-/// after this returns. Upstream allows 128 worlds (`src/constants.h:27`); a
-/// request beyond that is `WorldLimitReached`, which is upstream's null return
-/// (`src/world.c:115-118`) and not an allocation failure.
+/// Creates a world; reads `def` without retaining it.
+/// Returns `WorldLimitReached` when all world slots are in use.
 pub fn createWorld(def: *const WorldDef) CreateError!WorldId {
     const id = c.b2CreateWorld(def);
     if (isNullId(id)) return error.WorldLimitReached;
     return id;
 }
 
-/// `b2DestroyWorld` (`include/box2d/box2d.h:30`).
-///
-/// Destroys every body, shape, chain, joint and contact the world owns, in one
-/// call, and frees the world's pools (`src/world.c:263`). There is nothing to
-/// destroy individually afterwards and nothing to release: the world is the only
-/// owner. Every id this world handed out, including the `WorldId` passed in here,
-/// fails its `*IsValid` check afterwards.
+/// Destroys a world and all its owned objects, invalidating every id it issued.
+/// Frees the world's pools.
 pub fn destroyWorld(self: WorldId) void {
     c.b2DestroyWorld(self);
 }
 
-/// `b2World_IsValid` (`include/box2d/box2d.h:33`).
-///
-/// The only safe question to ask about a world handle. Every other world
-/// entry point resolves the handle through `b2GetWorldFromId`, which *asserts*
-/// on a mismatched index or generation (`src/world.c:45-52`), so a stale handle
-/// passed to one of them aborts rather than answering.
+/// Checks whether `id` is a live world handle; use before other world calls.
 pub fn worldIsValid(id: WorldId) bool {
     return c.b2World_IsValid(id);
 }
 
-/// `b2World_Step` (`include/box2d/box2d.h:39`).
-///
-/// Advances the simulation by `time_step` seconds, split into `sub_step_count`
-/// solver sub-steps. Upstream recommends four sub-steps at 60 Hz
-/// (`include/box2d/box2d.h:35-38`).
-///
-/// This is where events are produced. Read them after the step and before the
-/// next one; see `bodyMoveEvents` for the lifetime that gives.
-///
-/// While this runs the world is locked: `createBody`, the `create*Shape`
-/// functions and `createChain` return `WorldLocked` rather than half-applying
-/// themselves.
+/// Advances the simulation by `time_step`, split into solver sub-steps.
+/// Events last until the next step or destruction; creation helpers return `WorldLocked` during a step.
 pub fn worldStep(self: WorldId, time_step: f32, sub_step_count: c_int) void {
     c.b2World_Step(self, time_step, sub_step_count);
 }
 
-/// `b2World_Draw` (`include/box2d/box2d.h:42`).
-///
-/// Calls the function pointers in `draw` back, from inside Box2D. `draw` is
-/// borrowed for the call and the callback function addresses and the context
-/// pointer it carries are retained by the caller, not copied.
+/// Calls the drawing callbacks; `draw` and its contents are borrowed for the call.
 pub fn worldDraw(self: WorldId, draw: *DebugDraw) void {
     c.b2World_Draw(self, draw);
 }
 
-/// `b2World_GetBodyEvents` (`include/box2d/box2d.h:45`).
-///
-/// The raw form of `bodyMoveEvents`: a borrowed pointer and a count. Prefer the
-/// slice, which is this read through a bounded length.
+/// Returns the raw body event pointers and counts; prefer the bounded slice helpers.
 pub fn worldBodyEvents(self: WorldId) BodyEvents {
     return c.b2World_GetBodyEvents(self);
 }
 
-/// The body move events this world buffered during the last step.
-///
-/// **Borrowed.** The slice points into the world's own array and is valid until
-/// this world's next `worldStep` or until it is destroyed. Nothing is copied, and
-/// a caller that needs the data to outlive that must copy it itself.
-///
-/// Upstream populates it only for bodies that moved
-/// (`include/box2d/types.h:1126-1135`), so an empty slice is the normal answer
-/// for a world in which nothing moved.
+/// Returns body move events borrowed from the world until its next step or destruction.
+/// The slice is empty when no bodies moved.
 pub fn bodyMoveEvents(self: WorldId) []const BodyMoveEvent {
     const events = c.b2World_GetBodyEvents(self);
     return events.moveEvents[0..bounded(events.moveCount)];
@@ -2005,21 +1448,14 @@ pub fn worldSensorEvents(self: WorldId) SensorEvents {
     return c.b2World_GetSensorEvents(self);
 }
 
-/// The sensor begin-touch events this world buffered during the last step.
-///
-/// **Borrowed**, until this world's next `worldStep` or until it is destroyed.
-/// See `bodyMoveEvents` for the whole rule.
+/// Returns sensor begin events borrowed until the next step or world destruction.
 pub fn sensorBeginEvents(self: WorldId) []const SensorBeginTouchEvent {
     const events = c.b2World_GetSensorEvents(self);
     return events.beginEvents[0..bounded(events.beginCount)];
 }
 
-/// The sensor end-touch events this world buffered during the last step.
-///
-/// **Borrowed**, until this world's next `worldStep` or until it is destroyed.
-/// Either shape in an entry may already have been destroyed
-/// (`include/box2d/types.h:1015-1016`), so confirm with `shapeIsValid` before
-/// calling anything on the ids.
+/// Returns sensor end events borrowed until the next step or world destruction.
+/// Either shape id may be invalid; check it with `shapeIsValid`.
 pub fn sensorEndEvents(self: WorldId) []const SensorEndTouchEvent {
     const events = c.b2World_GetSensorEvents(self);
     return events.endEvents[0..bounded(events.endCount)];
@@ -2030,51 +1466,33 @@ pub fn worldContactEvents(self: WorldId) ContactEvents {
     return c.b2World_GetContactEvents(self);
 }
 
-/// The contact begin-touch events this world buffered during the last step.
-///
-/// **Borrowed**, until this world's next `worldStep` or until it is destroyed.
-/// Each entry carries the initial manifold, recorded before the solver runs, so
-/// its impulses are all zero (`include/box2d/types.h:1058-1060`).
+/// Returns contact begin events borrowed until the next step or world destruction.
+/// The initial manifold has zero impulses.
 pub fn contactBeginEvents(self: WorldId) []const ContactBeginTouchEvent {
     const events = c.b2World_GetContactEvents(self);
     return events.beginEvents[0..bounded(events.beginCount)];
 }
 
-/// The contact end-touch events this world buffered during the last step.
-///
-/// **Borrowed**, until this world's next `worldStep` or until it is destroyed.
-/// Either shape may already have been destroyed
-/// (`include/box2d/types.h:1070-1074`).
+/// Returns contact end events borrowed until the next step or world destruction.
+/// Either shape may already be destroyed.
 pub fn contactEndEvents(self: WorldId) []const ContactEndTouchEvent {
     const events = c.b2World_GetContactEvents(self);
     return events.endEvents[0..bounded(events.endCount)];
 }
 
-/// The contact hit events this world buffered during the last step.
-///
-/// **Borrowed**, until this world's next `worldStep` or until it is destroyed.
-/// A hit needs both shapes to have hit events enabled and the approach speed to
-/// exceed the world's hit-event threshold.
+/// Returns contact hit events borrowed until the next step or world destruction.
+/// Both shapes must enable hit events and exceed the world threshold.
 pub fn contactHitEvents(self: WorldId) []const ContactHitEvent {
     const events = c.b2World_GetContactEvents(self);
     return events.hitEvents[0..bounded(events.hitCount)];
 }
 
-/// Turn an upstream `int` event count into a `usize` without trusting it.
-///
-/// The count is upstream's own and is never negative, but a slice length is not
-/// a place to carry a negative number: clamping here keeps a malformed count from
-/// turning into a slice whose end precedes its start.
 fn bounded(count: c_int) usize {
     return @intCast(@max(count, 0));
 }
 
-/// `b2World_OverlapAABB` (`include/box2d/box2d.h:54`).
-/// `fcn` must not be null; see the module documentation.
-///
-/// Calls `fcn` once per shape whose AABB overlaps `aabb`. The callback and its
-/// `context` are borrowed for the call and not retained: the context must stay
-/// valid until `fcn` has returned, which is inside this call.
+/// Calls `fcn` for each shape overlapping `aabb`; the callback must be non-null.
+/// The callback and context are borrowed until the call returns.
 pub fn worldOverlapAabb(
     self: WorldId,
     aabb: Aabb,
@@ -2085,8 +1503,7 @@ pub fn worldOverlapAabb(
     return c.b2World_OverlapAABB(self, aabb, filter, fcn, context);
 }
 
-/// `b2World_OverlapShape` (`include/box2d/box2d.h:58`).
-/// `fcn` must not be null; see the module documentation.
+/// Calls `fcn` for each overlapping shape; the callback must be non-null.
 pub fn worldOverlapShape(
     self: WorldId,
     proxy: *const ShapeProxy,
@@ -2097,12 +1514,8 @@ pub fn worldOverlapShape(
     return c.b2World_OverlapShape(self, proxy, filter, fcn, context);
 }
 
-/// `b2World_CastRay` (`include/box2d/box2d.h:71`).
-/// `fcn` must not be null; see the module documentation.
-///
-/// `fcn` decides what "found" means: `-1` to ignore a shape and continue, `0` to
-/// stop, a fraction to clip the ray there, `1` to continue unclipped
-/// (`include/box2d/types.h:1207-1217`). Shapes arrive in any order.
+/// Casts a ray and reports hits through a non-null callback.
+/// Return -1 to ignore, 0 to stop, a fraction to clip, or 1 to continue.
 pub fn worldCastRay(
     self: WorldId,
     origin: Vec2,
@@ -2114,18 +1527,13 @@ pub fn worldCastRay(
     return c.b2World_CastRay(self, origin, translation, filter, fcn, context);
 }
 
-/// `b2World_CastRayClosest` (`include/box2d/box2d.h:76`).
-///
-/// The closest hit, with no callback to write. Upstream notes it ignores initial
-/// overlap and allows no custom filtering beyond `filter`. An initial overlap
-/// gives a zero fraction and a zero normal with an arbitrary point
-/// (`include/box2d/types.h:65`), which is why `hit` is the field to branch on.
+/// Returns the closest ray hit without a callback or custom filtering.
+/// Initial overlaps may have zero fraction and normal; check `hit`.
 pub fn worldCastRayClosest(self: WorldId, origin: Vec2, translation: Vec2, filter: QueryFilter) RayResult {
     return c.b2World_CastRayClosest(self, origin, translation, filter);
 }
 
-/// `b2World_CastShape` (`include/box2d/box2d.h:80`).
-/// `fcn` must not be null; see the module documentation.
+/// Casts a shape and reports hits through a non-null callback.
 pub fn worldCastShape(
     self: WorldId,
     proxy: *const ShapeProxy,
@@ -2137,22 +1545,13 @@ pub fn worldCastShape(
     return c.b2World_CastShape(self, proxy, translation, filter, fcn, context);
 }
 
-/// `b2World_CastMover` (`include/box2d/box2d.h:85`).
-///
-/// The single-answer form of a capsule character mover cast: the fraction of
-/// `translation` the mover may travel. Upstream says this is a special shape
-/// cast that slides along other shapes while reducing clipping
-/// (`include/box2d/box2d.h:82-84`).
+/// Casts a capsule mover and returns its allowed travel fraction.
 pub fn worldCastMover(self: WorldId, mover: *const Capsule, translation: Vec2, filter: QueryFilter) f32 {
     return c.b2World_CastMover(self, mover, translation, filter);
 }
 
-/// `b2World_CollideMover` (`include/box2d/box2d.h:89`).
-/// `fcn` must not be null; see the module documentation.
-///
-/// Gathers the collision planes a mover touches, which the caller assembles into
-/// `CollisionPlane`s for `solvePlanes`. Each plane is reported through `fcn`,
-/// which returns false to stop gathering.
+/// Reports collision planes for a mover through a non-null callback.
+/// Return false from the callback to stop gathering planes.
 pub fn worldCollideMover(
     self: WorldId,
     mover: *const Capsule,
@@ -2183,8 +1582,7 @@ pub fn worldIsContinuousEnabled(self: WorldId) bool {
     return c.b2World_IsContinuousEnabled(self);
 }
 
-/// `b2World_SetRestitutionThreshold` (`include/box2d/box2d.h:112`). Collisions
-/// slower than this do not bounce.
+/// Sets the minimum approach speed for a collision to bounce.
 pub fn worldSetRestitutionThreshold(self: WorldId, value: f32) void {
     c.b2World_SetRestitutionThreshold(self, value);
 }
@@ -2204,25 +1602,18 @@ pub fn worldGetHitEventThreshold(self: WorldId) f32 {
     return c.b2World_GetHitEventThreshold(self);
 }
 
-/// `b2World_SetCustomFilterCallback` (`include/box2d/box2d.h:126`).
-///
-/// The callback and its context are retained, not copied, so both must outlive
-/// the world or be cleared before it is destroyed. It runs on worker threads
-/// during the step and must not modify the world
-/// (`include/box2d/types.h:1173-1178`).
+/// Sets a filter callback retained by the world; it and its context must outlive it.
+/// It runs on worker threads and must not modify the world.
 pub fn worldSetCustomFilterCallback(self: WorldId, fcn: ?*const CustomFilterFn, context: ?*anyopaque) void {
     c.b2World_SetCustomFilterCallback(self, fcn, context);
 }
 
-/// `b2World_SetPreSolveCallback` (`include/box2d/box2d.h:129`).
-///
-/// Retained like a custom filter callback, and with the same threading rule.
+/// Sets the retained pre-solve callback; it follows the filter callback's lifetime and threading rules.
 pub fn worldSetPreSolveCallback(self: WorldId, fcn: ?*const PreSolveFn, context: ?*anyopaque) void {
     c.b2World_SetPreSolveCallback(self, fcn, context);
 }
 
-/// `b2World_SetGravity` (`include/box2d/box2d.h:134`). Box2D has no up vector, so
-/// gravity is whatever the caller says.
+/// Sets world gravity; Box2D has no default up direction.
 pub fn worldSetGravity(self: WorldId, gravity: Vec2) void {
     c.b2World_SetGravity(self, gravity);
 }
@@ -2232,8 +1623,7 @@ pub fn worldGetGravity(self: WorldId) Vec2 {
     return c.b2World_GetGravity(self);
 }
 
-/// `b2World_Explode` (`include/box2d/box2d.h:142`). Applies an impulse per unit
-/// length of the facing shape perimeter; `def` is read during the call.
+/// Applies an explosion impulse per unit perimeter; reads `explosion_def` during the call.
 pub fn worldExplode(self: WorldId, explosion_def: *const ExplosionDef) void {
     c.b2World_Explode(self, explosion_def);
 }
@@ -2268,11 +1658,7 @@ pub fn worldGetAwakeBodyCount(self: WorldId) c_int {
     return c.b2World_GetAwakeBodyCount(self);
 }
 
-/// `b2World_GetProfile` (`include/box2d/box2d.h:169`).
-///
-/// Per-stage timings in milliseconds for the last step. Upstream hides the struct
-/// from its documentation (`include/box2d/types.h:464-507`), so read it as a
-/// diagnostic and not as a contract.
+/// Returns per-stage timings in milliseconds for the last step.
 pub fn worldGetProfile(self: WorldId) Profile {
     return c.b2World_GetProfile(self);
 }
@@ -2282,8 +1668,7 @@ pub fn worldGetCounters(self: WorldId) Counters {
     return c.b2World_GetCounters(self);
 }
 
-/// `b2World_SetUserData` (`include/box2d/box2d.h:175`). The pointer is stored,
-/// not copied, so whatever it points at must outlive the world.
+/// Stores `user_data` without copying it; its pointee must outlive the world.
 pub fn worldSetUserData(self: WorldId, user_data: ?*anyopaque) void {
     c.b2World_SetUserData(self, user_data);
 }
@@ -2293,71 +1678,45 @@ pub fn worldGetUserData(self: WorldId) ?*anyopaque {
     return c.b2World_GetUserData(self);
 }
 
-/// `b2World_SetFrictionCallback` (`include/box2d/box2d.h:181`). Passing null
-/// restores the default `sqrt(frictionA * frictionB)`.
+/// Sets the friction mixer; null restores `sqrt(frictionA * frictionB)`.
 pub fn worldSetFrictionCallback(self: WorldId, callback: ?*const FrictionCallback) void {
     c.b2World_SetFrictionCallback(self, callback);
 }
 
-/// `b2World_SetRestitutionCallback` (`include/box2d/box2d.h:184`). Passing null
-/// restores the default `max(restitutionA, restitutionB)`.
+/// Sets the restitution mixer; null restores `max(restitutionA, restitutionB)`.
 pub fn worldSetRestitutionCallback(self: WorldId, callback: ?*const RestitutionCallback) void {
     c.b2World_SetRestitutionCallback(self, callback);
 }
 
-/// `b2World_DumpMemoryStats` (`include/box2d/box2d.h:187`). Writes
-/// `box2d_memory.txt` in the process's working directory.
+/// Writes `box2d_memory.txt` to the process working directory.
 pub fn worldDumpMemoryStats(self: WorldId) void {
     c.b2World_DumpMemoryStats(self);
 }
 
-/// `b2World_RebuildStaticTree` (`include/box2d/box2d.h:190`). For upstream's own
-/// testing.
+/// Rebuilds the static tree; intended for upstream testing.
 pub fn worldRebuildStaticTree(self: WorldId) void {
     c.b2World_RebuildStaticTree(self);
 }
 
-/// `b2World_EnableSpeculative` (`include/box2d/box2d.h:193`). For upstream's own
-/// testing.
+/// Enables speculative contacts; intended for upstream testing.
 pub fn worldEnableSpeculative(self: WorldId, flag: bool) void {
     c.b2World_EnableSpeculative(self, flag);
 }
 
-// ---------------------------------------------------------------------------
-// Body
-// ---------------------------------------------------------------------------
-
-/// `b2CreateBody` (`include/box2d/box2d.h:210`).
-///
-/// `def` is read during the call and not retained. A body is created **without**
-/// shapes: it has no mass, no bounding box and no contacts until one is added, and
-/// upstream says creating it at the origin and moving it afterwards nearly
-/// doubles the cost (`include/box2d/types.h:178-179`), so create it where it
-/// belongs.
-///
-/// `WorldLocked` is the null return for a world locked by a step or a callback
-/// (`src/body.c:192-195`).
+/// Creates a body from a definition read only during the call; it starts without shapes.
+/// Returns `WorldLocked` if the world is locked.
 pub fn createBody(world: WorldId, def: *const BodyDef) CreateError!BodyId {
     const id = c.b2CreateBody(world, def);
     if (isNullId(id)) return error.WorldLocked;
     return id;
 }
 
-/// `b2DestroyBody` (`include/box2d/box2d.h:214`).
-///
-/// Destroys the body, every shape on it, every joint attached to it, and its
-/// contacts, in one call. Nothing else refers to those handles afterwards, and
-/// the body slot's generation is bumped so the old `BodyId` stays invalid even if
-/// the index is reused (`src/body.c:297`).
+/// Destroys a body and its shapes, joints and contacts, invalidating their handles.
 pub fn destroyBody(self: BodyId) void {
     c.b2DestroyBody(self);
 }
 
-/// `b2Body_IsValid` (`include/box2d/box2d.h:217`).
-///
-/// False for a null id, a freed body, a mismatched generation, and every handle
-/// from a world that is gone. Safe to call on any body-shaped value; the other
-/// body entry points are not.
+/// Checks whether a body handle is live; safe for null, stale or destroyed-world ids.
 pub fn bodyIsValid(id: BodyId) bool {
     return c.b2Body_IsValid(id);
 }
@@ -2367,31 +1726,18 @@ pub fn bodyType(self: BodyId) BodyType {
     return c.b2Body_GetType(self);
 }
 
-/// `b2Body_SetType` (`include/box2d/box2d.h:224`).
-///
-/// Changing the type ends every contact the body had, which the next step turns
-/// into end-touch events for whatever had contact events enabled.
+/// Changes body type and ends its contacts, producing end-touch events next step.
 pub fn bodySetType(self: BodyId, body_type: BodyType) void {
     c.b2Body_SetType(self, body_type);
 }
 
-/// `b2Body_SetName` (`include/box2d/box2d.h:227`).
-///
-/// The name is **copied** into the body's own 32-byte field, so `name` may be a
-/// temporary. Upstream keeps at most 31 characters and NUL-terminates
-/// (`src/body.c:270-279`), so a longer name is truncated rather than rejected.
-///
-/// `name` is the `const char *` the header declares, so a string literal and any
-/// sentinel-terminated slice both work with no conversion step.
+/// Copies a sentinel-terminated name into the body, truncating to 31 bytes.
+/// The body owns it until the next `bodySetName` or body destruction.
 pub fn bodySetName(self: BodyId, name: [*:0]const u8) void {
     c.b2Body_SetName(self, name);
 }
 
-/// `b2Body_GetName` (`include/box2d/box2d.h:230`).
-///
-/// A pointer to the body's **own** storage, which lives as long as the body does
-/// and is overwritten by the next `bodySetName`. Upstream default-initialises it
-/// to an empty string, so it is never null and always NUL-terminated.
+/// Returns a NUL-terminated view into body-owned storage, valid until replaced or destroyed.
 pub fn bodyName(self: BodyId) [:0]const u8 {
     return std.mem.span(c.b2Body_GetName(self));
 }
@@ -2421,10 +1767,7 @@ pub fn bodyTransform(self: BodyId) Transform {
     return c.b2Body_GetTransform(self);
 }
 
-/// `b2Body_SetTransform` (`include/box2d/box2d.h:250`).
-///
-/// Teleports the body. The sweep is not updated, so contacts can be created or
-/// destroyed by the move; that is what produces end-touch events.
+/// Teleports the body; changed contacts produce end-touch events.
 pub fn bodySetTransform(self: BodyId, position: Vec2, rotation: Rot) void {
     c.b2Body_SetTransform(self, position, rotation);
 }
@@ -2469,11 +1812,7 @@ pub fn bodySetAngularVelocity(self: BodyId, angular_velocity: f32) void {
     c.b2Body_SetAngularVelocity(self, angular_velocity);
 }
 
-/// `b2Body_SetTargetTransform` (`include/box2d/box2d.h:280`).
-///
-/// Asks the body to reach `target` in `time_step` seconds, interpolating rather
-/// than teleporting. Upstream recommends this over `bodySetTransform` for
-/// moving a body without artefacts (`include/box2d/box2d.h:277-279`).
+/// Moves the body to `target` over `time_step` without teleporting.
 pub fn bodySetTargetTransform(self: BodyId, target: Transform, time_step: f32) void {
     c.b2Body_SetTargetTransform(self, target, time_step);
 }
@@ -2488,11 +1827,8 @@ pub fn bodyWorldPointVelocity(self: BodyId, world_point: Vec2) Vec2 {
     return c.b2Body_GetWorldPointVelocity(self, world_point);
 }
 
-/// `b2Body_ApplyForce` (`include/box2d/box2d.h:295`).
-///
-/// One call per step: a force is not a state, so a caller that wants a
-/// continuous push applies it again after every `worldStep`. `point` is in world
-/// coordinates, and `wake` decides whether a sleeping body is woken for it.
+/// `b2Body_ApplyForce` (`include/box2d/box2d.h:295`) applies force at world-space `point`; `wake` controls wake-up.
+/// Reapply each step for a continuous force.
 pub fn bodyApplyForce(self: BodyId, force: Vec2, point: Vec2, wake: bool) void {
     c.b2Body_ApplyForce(self, force, point, wake);
 }
@@ -2507,10 +1843,7 @@ pub fn bodyApplyTorque(self: BodyId, torque: f32, wake: bool) void {
     c.b2Body_ApplyTorque(self, torque, wake);
 }
 
-/// `b2Body_ApplyLinearImpulse` (`include/box2d/box2d.h:321`).
-///
-/// Unlike a force, an impulse is applied once and changes the velocity
-/// immediately.
+/// `b2Body_ApplyLinearImpulse` (`include/box2d/box2d.h:321`) applies one impulse at world-space `point`; `wake` controls wake-up.
 pub fn bodyApplyLinearImpulse(self: BodyId, impulse: Vec2, point: Vec2, wake: bool) void {
     c.b2Body_ApplyLinearImpulse(self, impulse, point, wake);
 }
@@ -2546,10 +1879,7 @@ pub fn bodyWorldCenterOfMass(self: BodyId) Vec2 {
     return c.b2Body_GetWorldCenterOfMass(self);
 }
 
-/// `b2Body_SetMassData` (`include/box2d/box2d.h:356`).
-///
-/// Overrides what the shapes imply. It is a snapshot: adding or destroying a shape
-/// afterwards recomputes the mass from the shapes and discards this.
+/// Overrides shape-derived mass until a shape is added or destroyed.
 pub fn bodySetMassData(self: BodyId, mass_data: MassData) void {
     c.b2Body_SetMassData(self, mass_data);
 }
@@ -2559,9 +1889,7 @@ pub fn bodyMassData(self: BodyId) MassData {
     return c.b2Body_GetMassData(self);
 }
 
-/// `b2Body_ApplyMassFromShapes` (`include/box2d/box2d.h:367`).
-///
-/// Discards a `bodySetMassData` override and recomputes from the shapes.
+/// Recomputes mass from the body's shapes and discards any override.
 pub fn bodyApplyMassFromShapes(self: BodyId) void {
     c.b2Body_ApplyMassFromShapes(self);
 }
@@ -2654,11 +1982,7 @@ pub fn bodyIsFixedRotation(self: BodyId) bool {
     return c.b2Body_IsFixedRotation(self);
 }
 
-/// `b2Body_SetBullet` (`include/box2d/box2d.h:425`).
-///
-/// Upstream warns bullets are not a general answer to fast dynamic-versus-dynamic
-/// collision and can interfere with joint constraints
-/// (`include/box2d/types.h:227-228`).
+/// Enables bullet mode; bullets are not a general fast-collision solution and can affect joints.
 pub fn bodySetBullet(self: BodyId, flag: bool) void {
     c.b2Body_SetBullet(self, flag);
 }
@@ -2683,20 +2007,13 @@ pub fn bodyWorld(self: BodyId) WorldId {
     return c.b2Body_GetWorld(self);
 }
 
-/// `b2Body_GetShapeCount` (`include/box2d/box2d.h:443`).
-///
-/// Size a slice for `bodyShapes` with this rather than with a guess.
+/// Returns the shape count; use it to size `bodyShapes` output.
 pub fn bodyShapeCount(self: BodyId) c_int {
     return c.b2Body_GetShapeCount(self);
 }
 
-/// `b2Body_GetShapes` (`include/box2d/box2d.h:447`).
-///
-/// Writes shape ids into `out` and returns how many it wrote, up to `out.len`.
-/// **It truncates silently**: a body with more shapes than `out` has room for
-/// returns `out.len`, not an error and not the real count. Upstream's loop stops
-/// at `capacity` (`src/body.c:1817`), so comparing the answer with `bodyShapeCount`
-/// is the caller's way to notice.
+/// Writes up to `out.len` shape ids and returns the number written.
+/// Truncates silently; compare with `bodyShapeCount` to detect an undersized slice.
 pub fn bodyShapes(self: BodyId, out: []ShapeId) usize {
     return @intCast(c.b2Body_GetShapes(self, out.ptr, @intCast(out.len)));
 }
@@ -2706,8 +2023,7 @@ pub fn bodyJointCount(self: BodyId) c_int {
     return c.b2Body_GetJointCount(self);
 }
 
-/// `b2Body_GetJoints` (`include/box2d/box2d.h:454`). Truncates like
-/// `bodyShapes`.
+/// Writes up to `out.len` joint ids and returns the number written.
 pub fn bodyJoints(self: BodyId, out: []JointId) usize {
     return @intCast(c.b2Body_GetJoints(self, out.ptr, @intCast(out.len)));
 }
@@ -2717,9 +2033,7 @@ pub fn bodyContactCapacity(self: BodyId) c_int {
     return c.b2Body_GetContactCapacity(self);
 }
 
-/// `b2Body_GetContactData` (`include/box2d/box2d.h:463`). Truncates like
-/// `bodyShapes`, and each entry's manifold is live solver state that the next
-/// step overwrites.
+/// Writes up to `out.len` contact records; truncates, and manifolds are overwritten next step.
 pub fn bodyContactData(self: BodyId, out: []ContactData) usize {
     return @intCast(c.b2Body_GetContactData(self, out.ptr, @intCast(out.len)));
 }
@@ -2729,91 +2043,43 @@ pub fn bodyComputeAabb(self: BodyId) Aabb {
     return c.b2Body_ComputeAABB(self);
 }
 
-/// A ready-made circle shape literal.
-///
-/// `b2Circle` is a center and a radius (`include/box2d/collision.h:104`), so this
-/// is the struct's own construction and not a call, for the same reason `vec2`
-/// is.
+/// Constructs a circle from its center and radius.
 pub fn circle(center: Vec2, radius: f32) Circle {
     return .{ .center = center, .radius = radius };
 }
 
-/// `b2CreateCircleShape` (`include/box2d/box2d.h:481`).
-///
-/// `circle` is **copied**, not retained (`src/shape.c:163-192`), so it may be a
-/// temporary. `def` is read and not retained either. Attaching a shape updates
-/// the body's mass when `def.update_body_mass` is set, which is upstream's
-/// default.
-///
-/// `WorldLocked` is upstream's null return for a locked world
-/// (`src/shape.c:172-176`).
+/// Creates a circle shape; geometry is copied and `def` is read only during the call.
+/// Returns `WorldLocked` when the world is locked.
 pub fn createCircleShape(body: BodyId, def: *const ShapeDef, geometry: *const Circle) CreateError!ShapeId {
     const id = c.b2CreateCircleShape(body, def, geometry);
     if (isNullId(id)) return error.WorldLocked;
     return id;
 }
 
-/// `b2CreateSegmentShape` (`include/box2d/box2d.h:486`).
-///
-/// Upstream **refuses** a degenerate segment rather than degrading it. When the
-/// squared length from `point1` to `point2` is at or below
-/// `B2_LINEAR_SLOP * B2_LINEAR_SLOP` (`src/constants.h:23`) it does
-/// `B2_ASSERT( false )` and returns `b2_nullShapeId`
-/// (`src/shape.c:219-224`): no shape is created, and nothing is quietly turned
-/// into a circle instead.
-///
-/// Which of the two things a caller sees depends on the build, and on one more
-/// thing besides `NDEBUG`. `B2_ASSERT` calls `b2InternalAssertFcn` first and
-/// reaches `B2_BREAKPOINT` only if that returns non-zero
-/// (`include/box2d/base.h:103-109`); `b2InternalAssertFcn` returns whatever the
-/// installed handler returns (`src/core.c:63-66`); and the default handler
-/// prints and returns 1 (`src/core.c:46-52`). So:
-///
-///   * `Debug` and `ReleaseSafe`, with the default handler, end in
-///     `B2_BREAKPOINT` (`include/box2d/base.h:91-99`) before the null id
-///     exists. The process does not return and this error is never reached.
-///   * `ReleaseFast` and `ReleaseSmall` compile `B2_ASSERT` out
-///     (`include/box2d/base.h:111`), the null id is returned, and this
-///     function reports `error.WorldLocked`.
-///   * Either mode, with a handler installed through `setAssertFcn`
-///     (`src/core.c:56-60`) that returns zero, the trap is skipped and the
-///     refusal arrives as `error.WorldLocked`.
-///
-/// `error.WorldLocked` therefore covers two upstream refusals this wrapper
-/// cannot tell apart: a locked world (`src/shape.c:172-176`) and this one.
+/// Refuses degenerate segments with an upstream assertion; if execution returns, the error is `WorldLocked`.
 pub fn createSegmentShape(body: BodyId, def: *const ShapeDef, geometry: *const Segment) CreateError!ShapeId {
     const id = c.b2CreateSegmentShape(body, def, geometry);
     if (isNullId(id)) return error.WorldLocked;
     return id;
 }
 
-/// `b2CreateCapsuleShape` (`include/box2d/box2d.h:491`).
-///
-/// This is the one shape constructor that degrades rather than refuses: centres
-/// that coincide, at or below `B2_LINEAR_SLOP * B2_LINEAR_SLOP`, become a
-/// circle centred on their midpoint (`src/shape.c:201-206`), which is
-/// observable through `shapeType`. A segment given coincident points is refused
-/// instead; see `createSegmentShape`.
+/// Creates a capsule shape; coincident centers within linear slop produce a circle.
+/// Returns `WorldLocked` if the world is locked.
 pub fn createCapsuleShape(body: BodyId, def: *const ShapeDef, geometry: *const Capsule) CreateError!ShapeId {
     const id = c.b2CreateCapsuleShape(body, def, geometry);
     if (isNullId(id)) return error.WorldLocked;
     return id;
 }
 
-/// `b2CreatePolygonShape` (`include/box2d/box2d.h:496`).
+/// Creates a polygon shape; geometry is copied and a locked world returns `WorldLocked`.
 pub fn createPolygonShape(body: BodyId, def: *const ShapeDef, geometry: *const Polygon) CreateError!ShapeId {
     const id = c.b2CreatePolygonShape(body, def, geometry);
     if (isNullId(id)) return error.WorldLocked;
     return id;
 }
 
-/// `b2DestroyShape` (`include/box2d/box2d.h:501`).
-///
-/// `update_body_mass` recomputes the owning body's mass; pass false to keep the
-/// mass as it is. Destroying a shape destroys its contacts and sensor overlaps,
-/// and the next step reports end-touch events for them. The shape slot's
-/// generation is bumped, so this `ShapeId` stays invalid
-/// (`src/shape.c:123`).
+/// Destroys a shape and its contacts and overlaps, invalidating its id.
+/// `update_body_mass` controls whether the owning body's mass is recomputed.
 pub fn destroyShape(self: ShapeId, update_body_mass: bool) void {
     c.b2DestroyShape(self, update_body_mass);
 }
@@ -2853,8 +2119,7 @@ pub fn shapeGetUserData(self: ShapeId) ?*anyopaque {
     return c.b2Shape_GetUserData(self);
 }
 
-/// `b2Shape_SetDensity` (`include/box2d/box2d.h:530`). `update_body_mass` has the
-/// same meaning as in `destroyShape`.
+/// Sets density; `update_body_mass` controls whether the body's mass is recomputed.
 pub fn shapeSetDensity(self: ShapeId, density: f32, update_body_mass: bool) void {
     c.b2Shape_SetDensity(self, density, update_body_mass);
 }
@@ -2884,9 +2149,7 @@ pub fn shapeRestitution(self: ShapeId) f32 {
     return c.b2Shape_GetRestitution(self);
 }
 
-/// `b2Shape_SetMaterial` (`include/box2d/box2d.h:551`). The user material id
-/// passed to the mixing callbacks and to query results; upstream does not use it
-/// internally (`include/box2d/types.h:345-347`).
+/// Sets the user material id passed to mixing callbacks and query results.
 pub fn shapeSetMaterial(self: ShapeId, material: c_int) void {
     c.b2Shape_SetMaterial(self, material);
 }
@@ -2912,10 +2175,7 @@ pub fn shapeFilter(self: ShapeId) Filter {
     return c.b2Shape_GetFilter(self);
 }
 
-/// `b2Shape_SetFilter` (`include/box2d/box2d.h:569`).
-///
-/// Changing a filter ends every contact the shape had, which the next step
-/// reports as end-touch events.
+/// `b2Shape_SetFilter` (`include/box2d/box2d.h:569`) ends the shape's contacts; the next step emits end-touch events.
 pub fn shapeSetFilter(self: ShapeId, filter: Filter) void {
     c.b2Shape_SetFilter(self, filter);
 }
@@ -2942,9 +2202,7 @@ pub fn shapeAreContactEventsEnabled(self: ShapeId) bool {
     return c.b2Shape_AreContactEventsEnabled(self);
 }
 
-/// `b2Shape_EnablePreSolveEvents` (`include/box2d/box2d.h:589`). Dynamic bodies
-/// only, and upstream calls these expensive because of the threading
-/// (`include/box2d/types.h:394-396`).
+/// `b2Shape_EnablePreSolveEvents` (`include/box2d/box2d.h:589`) is dynamic-body-only and incurs threading cost (`include/box2d/types.h:394-396`).
 pub fn shapeEnablePreSolveEvents(self: ShapeId, flag: bool) void {
     c.b2Shape_EnablePreSolveEvents(self, flag);
 }
@@ -2969,8 +2227,7 @@ pub fn shapeTestPoint(self: ShapeId, point: Vec2) bool {
     return c.b2Shape_TestPoint(self, point);
 }
 
-/// `b2Shape_RayCast` (`include/box2d/box2d.h:605`). `input` is read during the
-/// call and not retained.
+/// Casts the shape using `input`, which is read only during the call.
 pub fn shapeRayCast(self: ShapeId, input: *const RayCastInput) CastOutput {
     return c.b2Shape_RayCast(self, input);
 }
@@ -2985,8 +2242,7 @@ pub fn shapeSegment(self: ShapeId) Segment {
     return c.b2Shape_GetSegment(self);
 }
 
-/// `b2Shape_GetChainSegment` (`include/box2d/box2d.h:615`). Only meaningful for a
-/// `b2_chainSegmentShape`.
+/// Returns chain-segment geometry; valid only for chain-segment shapes.
 pub fn shapeChainSegment(self: ShapeId) ChainSegment {
     return c.b2Shape_GetChainSegment(self);
 }
@@ -3001,8 +2257,7 @@ pub fn shapePolygon(self: ShapeId) Polygon {
     return c.b2Shape_GetPolygon(self);
 }
 
-/// `b2Shape_SetCircle` (`include/box2d/box2d.h:626`). Moves the shape and resets
-/// its contacts; `geometry` is copied.
+/// Copies the geometry, moves the shape and resets its contacts.
 pub fn shapeSetCircle(self: ShapeId, geometry: *const Circle) void {
     c.b2Shape_SetCircle(self, geometry);
 }
@@ -3022,8 +2277,7 @@ pub fn shapeSetPolygon(self: ShapeId, geometry: *const Polygon) void {
     c.b2Shape_SetPolygon(self, geometry);
 }
 
-/// `b2Shape_GetParentChain` (`include/box2d/box2d.h:643`). The null chain id for
-/// a shape that is not one of a chain's segments.
+/// Returns the parent chain id, or a null id for a non-chain shape.
 pub fn shapeParentChain(self: ShapeId) ChainId {
     return c.b2Shape_GetParentChain(self);
 }
@@ -3033,8 +2287,7 @@ pub fn shapeContactCapacity(self: ShapeId) c_int {
     return c.b2Shape_GetContactCapacity(self);
 }
 
-/// `b2Shape_GetContactData` (`include/box2d/box2d.h:652`). Truncates like
-/// `bodyShapes`.
+/// Writes up to `out.len` contact records and truncates like `bodyShapes`.
 pub fn shapeContactData(self: ShapeId, out: []ContactData) usize {
     return @intCast(c.b2Shape_GetContactData(self, out.ptr, @intCast(out.len)));
 }
@@ -3044,8 +2297,7 @@ pub fn shapeSensorCapacity(self: ShapeId) c_int {
     return c.b2Shape_GetSensorCapacity(self);
 }
 
-/// `b2Shape_GetSensorOverlaps` (`include/box2d/box2d.h:667`). Truncates like
-/// `bodyShapes`.
+/// Writes up to `out.len` overlapping shape ids and truncates like `bodyShapes`.
 pub fn shapeSensorOverlaps(self: ShapeId, out: []ShapeId) usize {
     return @intCast(c.b2Shape_GetSensorOverlaps(self, out.ptr, @intCast(out.len)));
 }
@@ -3065,26 +2317,15 @@ pub fn shapeClosestPoint(self: ShapeId, target: Vec2) Vec2 {
     return c.b2Shape_GetClosestPoint(self, target);
 }
 
-/// `b2CreateChain` (`include/box2d/box2d.h:683`).
-///
-/// `def.points` and `def.materials` are **cloned**, so both may be temporaries
-/// (`include/box2d/types.h:434,440`). The chain's own `ChainId` is separate from
-/// the `ShapeId`s of the segment shapes it creates, which `chainSegments` returns.
-///
-/// Upstream's warning at `include/box2d/types.h:414-425` is the contract: a chain
-/// is one-sided, has no mass, wants a static body, needs at least four points
-/// wound counter-clockwise, and has no collision on its first and last edge.
+/// Clones points and materials; requires a static body and at least four counter-clockwise points.
+/// Chains are one-sided, have no mass, and create separate segment shape ids.
 pub fn createChain(body: BodyId, def: *const ChainDef) CreateError!ChainId {
     const id = c.b2CreateChain(body, def);
     if (isNullId(id)) return error.WorldLocked;
     return id;
 }
 
-/// `b2DestroyChain` (`include/box2d/box2d.h:686`).
-///
-/// Destroys the chain and every segment shape it created
-/// (`include/box2d/types.h:424`), so the segment ids from `chainSegments` are
-/// stale afterwards too.
+/// Destroys the chain and every segment shape it created.
 pub fn destroyChain(self: ChainId) void {
     c.b2DestroyChain(self);
 }
@@ -3099,8 +2340,7 @@ pub fn chainSegmentCount(self: ChainId) c_int {
     return c.b2Chain_GetSegmentCount(self);
 }
 
-/// `b2Chain_GetSegments` (`include/box2d/box2d.h:696`). Truncates like
-/// `bodyShapes`.
+/// Writes up to `out.len` segment shape ids and truncates like `bodyShapes`.
 pub fn chainSegments(self: ChainId, out: []ShapeId) usize {
     return @intCast(c.b2Chain_GetSegments(self, out.ptr, @intCast(out.len)));
 }
@@ -3140,16 +2380,7 @@ pub fn chainIsValid(id: ChainId) bool {
     return c.b2Chain_IsValid(id);
 }
 
-// ---------------------------------------------------------------------------
-// Joints
-//
-// Every joint type shares the accessors below; the per-type tuning functions
-// follow, one group per joint, and every one of them is reachable through `c`
-// even where it is not named here.
-// ---------------------------------------------------------------------------
-
-/// `b2DestroyJoint` (`include/box2d/box2d.h:731`). Removing a joint wakes the
-/// bodies it joined.
+/// Destroys a joint and wakes the bodies it joined.
 pub fn destroyJoint(self: JointId) void {
     c.b2DestroyJoint(self);
 }
@@ -3264,11 +2495,8 @@ pub fn jointAngularSeparation(self: JointId) f32 {
     return c.b2Joint_GetAngularSeparation(self);
 }
 
-/// `b2Joint_GetConstraintTuning` (`include/box2d/box2d.h:800`).
-///
-/// Upstream fills two `float` out-parameters; a caller almost always wants them
-/// together, so they come back as one value here. Read them before stepping: they
-/// describe the last solve.
+/// Returns frequency and damping ratio from the last solve.
+/// Combines upstream's two out-parameters into `ConstraintTuning`.
 pub fn jointConstraintTuning(self: JointId) ConstraintTuning {
     var hertz: f32 = 0;
     var damping_ratio: f32 = 0;
@@ -3290,8 +2518,7 @@ pub fn jointSetConstraintTuning(self: JointId, hertz: f32, damping_ratio: f32) v
     c.b2Joint_SetConstraintTuning(self, hertz, damping_ratio);
 }
 
-/// `b2CreateDistanceJoint` (`include/box2d/box2d.h:816`). `def` is read and not
-/// retained.
+/// Creates a distance joint; reads `def` without retaining it.
 pub fn createDistanceJoint(world: WorldId, def: *const DistanceJointDef) JointId {
     return c.b2CreateDistanceJoint(world, def);
 }
@@ -3502,10 +2729,7 @@ pub fn mouseJointMaxForce(self: JointId) f32 {
     return c.b2MouseJoint_GetMaxForce(self);
 }
 
-/// `b2CreateFilterJoint` (`include/box2d/box2d.h:983`).
-///
-/// A joint whose only job is to carry a collision filter between two bodies: it
-/// suppresses contact between them while they are connected.
+/// Creates a joint that suppresses contact between its two bodies while connected.
 pub fn createFilterJoint(world: WorldId, def: *const FilterJointDef) JointId {
     return c.b2CreateFilterJoint(world, def);
 }

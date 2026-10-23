@@ -1,39 +1,5 @@
-# Canonical development environment for the Box2D SDK.
-#
-# `packages` is tools only. The SDK package is deliberately absent: entering a
-# shell must not build the library you came to work on.
-#
-# `outputs` exposes the same `package.nix` the flake builds, lazily. Nothing is
-# realised until `devenv build outputs.static` (or `.shared`) is run, so the
-# shell stays cheap while the packaging route stays real.
-#
-# No host path, account, mount or store path is written in this file, and no
-# variable the caller supplied is erased. Where the Zig caches go is decided by
-# the environment this shell is entered from: `enterShell` fills a missing one
-# so an interactive build agrees with the tasks, and every task body repeats
-# that fill, because `devenv tasks run --mode single` reaches a body without
-# passing through the shell hook. Every task and script below starts from this
-# module's own directory, because devenv runs both of them with the caller's
-# working directory.
-#
-# What was observed, and what was not. On 2026-10-04 the driver built this SDK's
-# two Nix outputs from the flake (`path:<sdk>#static` and `path:<sdk>#shared`)
-# and both were realised: `nix-acceptance-20261004T175328Z`,
-# `box2d-nix-build.log`, exit 0, two `drvPath`s and two store outputs. The six
-# devenv gates in that same run never reached a task or a script — `flake: false`
-# in `devenv.yaml` made devenv's nixpkgs a plain source tree with no `lib`, and
-# every subcommand died in bootstrap at `lib = nixpkgs.lib` with
-# `error: attribute 'lib' missing`. The key is deleted; the pinned revision is
-# unchanged. Nothing in this file has been run since that edit, so its
-# statements about the build graph remain SOURCE-CONFIRMED by reading
-# `build.zig` and `package.nix` in this repository, and every derivation, task
-# and script below is PENDING-VERIFICATION again.
-#
-# Nothing below derives from `$PWD` or `$DEVENV_ROOT`. Under the canonical
-# `devenv --from path:<sdk>` run those name a scratch project that holds
-# neither `build.zig` nor `UPSTREAM.sha256` nor `consumer/`: observed for this
-# SDK's siblings on 2026-10-04, in `devenv info`'s own `DEVENV_ROOT`, and again
-# as `error: no build.zig file found` from a canonical entry.
+# Development environment for the Box2D SDK.
+# Tool-only shell; package outputs build only when requested.
 
 { pkgs, lib, ... }:
 
@@ -47,36 +13,15 @@ let
   # Read for its declared identity only; reading `.version` does not realise it.
   box2dStatic = mkBox2d "static";
 
-  # This module's own directory, and the shell-quoted form every body below
-  # starts from.
-  #
-  # `./.` in an expression is relative to the file that contains it, so this is
-  # the SDK root however devenv was invoked. It is `builtins.toString` and not
-  # `"${./.}"` deliberately: interpolating a path copies it into the read-only
-  # Nix store, which for this tree would be a second, frozen copy of the whole
-  # SDK rather than the working tree an integrity record, an edit and a
-  # consumer's path dependency are about.
+  # Resolve this source root without copying the tree into the Nix store.
   sdkRoot = builtins.toString ./.;
   sdkRootArg = lib.escapeShellArg sdkRoot;
 
-  # The build cache and every delivery output go beneath the local cache the
-  # caller's environment already names, never into this repository and never
-  # onto a volume this file knows nothing about. The path is assembled here, in
-  # Nix, and expanded by the shell at run time because the location is the
-  # caller's rather than this file's.
+  # Keep build outputs beneath the caller's local cache.
   cacheDir = "$ZIG_LOCAL_CACHE_DIR/box2d";
   installPrefix = "$ZIG_LOCAL_CACHE_DIR/box2d-prefix";
 
-  # The one preamble every task and script below opens with: this module's own
-  # directory, then the two Zig cache locations, then a refusal rather than a
-  # guess. A value the caller already exported is used unchanged; only a missing
-  # one is filled in, from `XDG_CACHE_HOME` first and `TMPDIR` second, which is
-  # the order `blake3`, `box3d` and `geographiclib-c` already use. The fill is
-  # repeated here rather than left to `enterShell` because
-  # `devenv tasks run --mode single` bypasses the shell hook and reaches a body
-  # on its own, so this has to happen before the compiler is invoked. No
-  # fallback is a literal `/tmp`, `/var/tmp`, an NFS mount or a path inside this
-  # repository, and nothing here invents a name of its own.
+  # Enter the SDK root and fill only unset Zig cache paths.
   cdSdkRoot = ''
     cd ${sdkRootArg} || exit 1
     if [ -z "''${ZIG_LOCAL_CACHE_DIR:-}" ]; then
@@ -104,19 +49,14 @@ let
   '';
 in
 {
-  # Tools only, and unconditional: the SDK package is never among them, so
-  # entering the shell cannot build the library. A caller who wants a
-  # different tool list overrides `packages` in their own module.
+  # The shell includes tools only; entering it does not build the SDK.
   packages = [
     pkgs.zig_0_16
     pkgs.pkg-config
     pkgs.git
   ];
 
-  # `outputs`, `tasks`, `scripts`, `enterShell` and `assertions` are top-level
-  # devenv options, so they are declared at the top level too. Under a
-  # `lib.mkIf` guard they would all vanish unless a flag were set in
-  # `devenv.yaml`, and `devenv build outputs.static` would have nothing to build.
+  # Keep outputs, tasks, scripts and assertions at the module root.
   outputs = {
     static = box2dStatic;
     shared = mkBox2d "dynamic";
@@ -129,12 +69,7 @@ in
   };
 
   enterShell = ''
-    # Approved local scratch, never the repository and never a small system
-    # temporary filesystem. A value the caller already exported wins; this
-    # shell only fills in a default derived from XDG_CACHE_HOME first and
-    # TMPDIR second, which is the same order and the same names every task body
-    # below uses, and if neither names a location it says so rather than
-    # choosing one.
+    # Fill missing cache paths from XDG_CACHE_HOME or TMPDIR.
     if [ -n "''${XDG_CACHE_HOME:-}" ] || [ -n "''${TMPDIR:-}" ]; then
       box2d_cache_base="''${XDG_CACHE_HOME:-''${TMPDIR}}"
       : "''${ZIG_GLOBAL_CACHE_DIR:=$box2d_cache_base/zig-global-cache}"
@@ -160,20 +95,8 @@ in
     echo "  cache:     ZIG_LOCAL_CACHE_DIR/box2d, ZIG_LOCAL_CACHE_DIR/box2d-prefix"
   '';
 
-  # Namespaced: devenv puts task names on one list, and a bare `build` or
-  # `test` would collide with the ordinary shell commands of the same name.
-  #
-  # Every body below starts from this module's own directory: `cdSdkRoot` for
-  # every task and script that reaches a compiler, a plain `cd` for the two Nix
-  # builds and the integrity check, which need the directory but no cache. A
-  # task is executed with the caller's working directory, not with this
-  # module's, and that directory is not required to hold `build.zig`.
-  #
-  # `--cache-dir` and `--prefix` then keep what the run generates under the
-  # local cache the caller's environment already named; `-j8` is this
-  # workspace's job count and `--summary all` the step list this workspace's
-  # gates are read against, so a task does not silently drop to one job or to
-  # a single-line build summary.
+  # Namespace tasks and run each command from the SDK root.
+  # Forward cache, prefix, job and summary options.
   tasks = {
     "box2d:build" = {
       description = "Build the native library and compile the smoke example";
@@ -223,19 +146,7 @@ in
       '';
     };
 
-    # `cross-test` is the workspace's own tool and it owns every path it uses:
-    # `cross-test.profile.sh` refuses to name a compiler cache or an output
-    # directory, and the harness refuses `--cache-dir`, `--prefix`, `--summary`
-    # and `-j` after `--` outright, so this body names neither path flag. It
-    # starts from this module's own directory and lets the preamble place the
-    # global cache it reads at `cross-test:752`.
-    #
-    # Its concurrency is named here rather than left to the harness defaults,
-    # which are `--jobs 2 --build-jobs 1`: this workspace's eight jobs on both
-    # axes, so the matrix does not silently drop to one compiler job per target.
-    # These are the harness's own flags, two separate tokens each; every other
-    # setting, the matrix, the build step and the deadlines stays with
-    # `cross-test.profile.sh`.
+    # Matrix settings live in cross-test.profile.sh; this task sets concurrency.
     "box2d:matrix" = {
       description = "Run this workspace's full published platform matrix";
       exec = ''
@@ -245,14 +156,9 @@ in
     };
   };
 
-  # devenv runs a string script through a shell, which is what these need:
-  # the integrity check has to be able to fail the script, and the two Nix
-  # builds need their own arguments.
+  # Scripts run through a shell to support hooks and arguments.
   scripts = {
-    # The integrity record compares the bytes this fork did not author
-    # against the digests recorded when the tree was acquired. Its paths are
-    # relative to the tree, so this one has to run there and not in whatever
-    # directory the caller happened to be standing in.
+    # Run the integrity check from the SDK root; its paths are relative.
     "box2d:integrity" = {
       description = "Check every upstream and vendored digest in UPSTREAM.sha256";
       exec = ''
@@ -261,8 +167,7 @@ in
       '';
     };
 
-    # The consumer is a separate package with its own build graph, so a
-    # failure here localises to the consumer rather than to the SDK.
+    # Keep the consumer build as a separate task.
     "box2d:consumer" = {
       description = "Build and run the separate consumer package";
       exec = ''
@@ -272,12 +177,7 @@ in
       '';
     };
 
-    # `path:` rather than `.`: a flake evaluated from a git checkout carries
-    # only committed files, and this working copy is uncommitted. `path:`
-    # evaluates the tree this module lives in, which is what makes these two
-    # work from any directory and not only from the one the caller started in.
-    # That tree's `flake.lock` is what makes these builds resolve the pinned
-    # revision rather than a branch.
+  # Use path: to evaluate this source tree from any working directory.
     "box2d:package-static" = {
       description = "Build the static Nix variant through the flake";
       exec = ''

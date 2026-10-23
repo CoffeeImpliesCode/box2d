@@ -1,51 +1,7 @@
 // SPDX-License-Identifier: MIT
 //
-//! Consumes the `box2d` package the way an outside project would.
-//!
-//! Everything here goes through the published surface only: `dep.module` in
-//! `build.zig`, and `@import("box2d")` here. No path reaches into the library's
-//! own tree, so if this builds and produces the answers below, the module
-//! contract is real.
-//!
-//! ## Why these answers and not others
-//!
-//! This is not a version print and not a round trip through the same code. Each
-//! expected value is worked out on paper and compared with what the library
-//! returned:
-//!
-//!   * **Free fall.** A box released at rest at `y = 1` under gravity `(0, -10)`,
-//!     stepped ten times at 1/60 s in four sub-steps, is inside the
-//!     discretisation envelope around `y0 - g t^2 / 2` with downward speed
-//!     `g t`. The height is a bound rather than an equality because subdividing a
-//!     step is the solver's business: any stepper that adds `g h` to the velocity
-//!     and `v h` to the position trails the continuous trajectory by at most
-//!     `g h t / 2`. A body that were never stepped must still be at `1`, which is
-//!     the other half of the same claim.
-//!   * **A stale handle.** Destroying a body invalidates its id, and the next
-//!     body takes the same index with a different generation. An
-//!     implementation that compared only the index would report the stale handle
-//!     as live.
-//!   * **The creation boundary.** The 129th world is refused with
-//!     `WorldLimitReached`; freeing a slot makes room again.
-//!   * **A borrowed event slice.** One sensor overlapping one visitor produces
-//!     exactly one begin event naming both, and moving the sensor produces exactly
-//!     one end event.
-//!   * **Geometry and mass.** A unit circle of unit density has mass `pi` and
-//!     rotational inertia `pi/2`; the hull of a unit square encloses area 1 by the
-//!     shoelace formula, computed here from the vertices the library returned; the
-//!     vector `(3, 4)` has length 5 and unit direction `(0.6, 0.8)`.
-//!
-//! Any mismatch exits non-zero. The raw route is used for exactly one thing: the
-//! version line, so it names the C library this build actually reached rather
-//! than a constant compiled into this program.
-//!
-//! ## Two configurations
-//!
-//! The same source builds against a linked package and against a runtime-loaded
-//! one. `box2d.runtime_loaded` is a comptime constant, so the difference is one
-//! branch and no duplicated program: in the runtime-loaded build the provider is
-//! named on the command line (`--provider <path>`) or in `BOX2D_TEST_PROVIDER`,
-//! loaded once, and the same answers follow.
+//! Example consumer of the public `box2d` module.
+//! Checks representative physics, handle, sensor, and geometry results.
 
 const std = @import("std");
 const box2d = @import("box2d");
@@ -60,58 +16,34 @@ const steps: u32 = 10;
 const box_half: f32 = 0.5;
 const release_height: f32 = 1.0;
 
-/// How far two ordinary numbers may differ and still be the same answer. Four to
-/// six orders of magnitude above the `f32` rounding this accumulates over ten
-/// steps, and orders of magnitude below any wrong answer.
+/// Absolute tolerance for floating-point comparisons.
 const tolerance: f32 = 1e-4;
 
-/// The `f32` slack `fallEnvelope` carries on top of its discretisation term,
-/// metres. Ten steps accumulate a handful of roundings near 1 m, so this is
-/// several times what they can add without being wide enough to accept a wrong
-/// answer.
+/// Additional floating-point slack, in metres.
 const rounding: f32 = 1e-5;
 
-/// The sub-step the solver integrates over, seconds: the world time step split
-/// into `sub_steps` equal parts.
+/// Duration of one solver sub-step, in seconds.
 const sub_step: f32 = time_step / @as(f32, @floatFromInt(sub_steps));
 
-/// The height the released box passes through after `n` world steps, metres.
-///
-/// `y0 - g t^2 / 2` with `t = n * time_step`: the continuous trajectory of a body
-/// released from rest under `gravity`, and a property of the motion rather than
-/// of any stepper.
+/// Continuous free-fall height after `n` world steps.
 fn ballisticHeight(n: u32) f32 {
     const t = @as(f32, @floatFromInt(n)) * time_step;
     return release_height - 0.5 * gravity * t * t;
 }
 
-/// The downward speed the released box has after `n` world steps, m/s.
-///
-/// `-g t`. Constant acceleration from rest gives this velocity at every step
-/// size, so it is checked outright rather than within a bound.
+/// Downward speed after `n` world steps.
 fn ballisticSpeed(n: u32) f32 {
     const t = @as(f32, @floatFromInt(n)) * time_step;
     return -gravity * t;
 }
 
-/// How far an integration over sub-steps of `sub_step` may sit from
-/// `ballisticHeight(n)`, metres.
-///
-/// A stepper that adds `gravity * sub_step` to the velocity and `v * sub_step`
-/// to the position each sub-step trails the continuous trajectory by at most one
-/// sub-step's worth of velocity, `gravity * sub_step * t / 2`. That is the whole
-/// discretisation term; `rounding` is the `f32` slack underneath it.
-///
-/// It stays twenty times narrower than the nearest wrong answer: at ten steps a
-/// body that was never stepped is 0.14 m away and one under half the gravity is
-/// 0.07 m away.
+/// Height error bound after `n` semi-implicit steps, including rounding slack.
 fn fallEnvelope(n: u32) f32 {
     const t = @as(f32, @floatFromInt(n)) * time_step;
     return 0.5 * gravity * sub_step * t + rounding;
 }
 
-/// Run every check and exit non-zero on the first answer that does not match the
-/// expectation derived for it.
+/// Run every check and fail on the first mismatch.
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
 
@@ -124,7 +56,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     try w.print("box2d consumer\n", .{});
-    // The raw route, for the one value that must come from the C library itself.
+    // Read the version from the native library.
     {
         const version = box2d.getVersion();
         try w.print("{s} C library reports version {d}.{d}.{d}\n", .{
@@ -134,8 +66,6 @@ pub fn main(init: std.process.Init) !void {
             version.revision,
         });
     }
-
-    // --- geometry and mass, with no world in existence ----------------------
 
     const corners = [_]box2d.Vec2{
         box2d.vec2(0, 0),
@@ -160,8 +90,7 @@ pub fn main(init: std.process.Init) !void {
     try check(w, "unit direction x of (3, 4)", forty_five.direction.x, 0.6);
     try check(w, "unit direction y of (3, 4)", forty_five.direction.y, 0.8);
 
-    // Two points do not bound a hull, which is the boundary of the one error this
-    // package can raise about geometry.
+    // Two points cannot form a hull.
     const two_points = [_]box2d.Vec2{ box2d.vec2(0, 0), box2d.vec2(1, 1) };
     if (box2d.computeHull(&two_points)) |_| {
         try w.print("two points produced a hull\n", .{});
@@ -170,8 +99,7 @@ pub fn main(init: std.process.Init) !void {
         try w.print("two points refused with {t}\n", .{err});
     }
 
-    // The fixture world lives in its own block so that it is destroyed before the
-    // creation-boundary check below, which needs every world slot to itself.
+    // Destroy the fixture world before checking the world limit.
     {
         var world_def = box2d.defaultWorldDef();
         world_def.gravity = box2d.vec2(0, -gravity);
@@ -184,8 +112,6 @@ pub fn main(init: std.process.Init) !void {
 
         try fixtureRun(w, world);
     }
-
-    // --- the creation boundary ---------------------------------------------
 
     try w.print("refusing world 129 of 128\n", .{});
     const remaining = 128;
@@ -207,8 +133,7 @@ pub fn main(init: std.process.Init) !void {
         try w.print("  the 129th world was refused with {t}\n", .{err});
     }
 
-    // Freeing one slot makes room again, and the reused slot carries a new
-    // generation so the destroyed handle cannot come back.
+    // Reused slots must carry a different generation.
     const freed = worlds[remaining - 1];
     box2d.destroyWorld(freed);
     if (box2d.worldIsValid(freed)) {
@@ -235,16 +160,10 @@ pub fn main(init: std.process.Init) !void {
     try w.flush();
 }
 
-/// Everything that needs a live world: the fall, the borrowed event slices, and
-/// the handle transitions.
-///
-/// Split out of `main` so that `main` reads as the package's story and this reads
-/// as the fixture's.
+/// Runs world-dependent fall, sensor, and handle checks.
 fn fixtureRun(w: *std.Io.Writer, world: box2d.WorldId) !void {
 
-    // A static floor centred at y = -1 with a half-height of 0.5, so its top
-    // surface is at y = -0.5 and the released box, whose bottom face starts at
-    // y = 0.5, is a full metre clear of it: nothing touches.
+    // Keep the floor below the box during the initial fall check.
     var floor_def = box2d.defaultBodyDef();
     floor_def.position = box2d.vec2(0, -1);
     const floor = box2d.createBody(world, &floor_def) catch |err| {
@@ -278,8 +197,7 @@ fn fixtureRun(w: *std.Io.Writer, world: box2d.WorldId) !void {
         };
     }
 
-    // Nothing has been stepped, so the box is exactly where it was released. A
-    // half-applied creation would show up here as a different height.
+    // Check the initial transform before stepping.
     try check(w, "released height before stepping", box2d.bodyPosition(body).y, release_height);
     try check(w, "release speed before stepping", box2d.bodyLinearVelocity(body).y, 0);
 
@@ -298,12 +216,7 @@ fn fixtureRun(w: *std.Io.Writer, world: box2d.WorldId) !void {
         try check(w, "free fall speed", velocity.y, ballisticSpeed(n + 1));
     }
 
-    // --- a borrowed event slice, read before the next step ------------------
-
-    // A sensor whose top face is at y = -0.125, below where the ten free-fall
-    // steps above left the box's bottom face, so nothing overlaps at first and
-    // the box has to fall 0.625 m to reach it. The floor's top surface is at
-    // y = -0.5, another 0.375 m further down.
+    // The sensor starts below the box's current free-fall position.
     var sensor_body_def = box2d.defaultBodyDef();
     sensor_body_def.position = box2d.vec2(0, -0.25);
     const sensor_body = box2d.createBody(world, &sensor_body_def) catch |err| {
@@ -325,11 +238,8 @@ fn fixtureRun(w: *std.Io.Writer, world: box2d.WorldId) !void {
         return error.ConsumerCheckFailed;
     }
 
-    // Step until the overlap is reported. The event array belongs to one step, so
-    // a fixed step count would be reading a step that may be long past the one
-    // that produced it. Two hundred is far beyond what the box needs: it reaches
-    // the sensor about eleven steps from here and would reach the floor about six
-    // steps after that.
+    // Read events after each step; the event slice belongs to that step.
+    // The bound exceeds the steps needed for the box to reach the sensor.
     var begin_count: usize = 0;
     var begin_sensor: box2d.ShapeId = box2d.null_shape_id;
     n = 0;
@@ -351,14 +261,8 @@ fn fixtureRun(w: *std.Io.Writer, world: box2d.WorldId) !void {
     box2d.worldStep(world, time_step, sub_steps);
     try check(w, "sensor end events", @floatFromInt(box2d.sensorEndEvents(world).len), 1);
 
-    // --- the handle transitions --------------------------------------------
-
-    // `bodyShapes` returns how many ids it wrote into the caller's slice, so
-    // the first id sits at index zero: `src/body.c:1817` ends the walk at
-    // `capacity` and `src/body.c:1827` returns that count, which is a count of
-    // writes and not a position. The released box has carried the same single
-    // polygon since it was created, so the returned count says which id this is
-    // and says that nothing was truncated.
+    // `bodyShapes` returns a count, so the first written ID is at index zero.
+    // One expected shape fits in the four-entry buffer without truncation.
     var shapes: [4]box2d.ShapeId = undefined;
     const written = box2d.bodyShapes(body, &shapes);
     if (written != 1) {
@@ -397,10 +301,7 @@ fn fixtureRun(w: *std.Io.Writer, world: box2d.WorldId) !void {
     try w.print("stale handle refused after the slot was reused\n", .{});
 }
 
-/// The area a polygon encloses, from its vertices alone.
-///
-/// The shoelace formula, so this is a property of the points rather than of
-/// anything Box2D computed, which is what makes it an independent answer.
+/// Independent polygon area from its vertices using the shoelace formula.
 fn shoelaceArea(polygon: *const box2d.Polygon) f32 {
     const count: usize = @intCast(polygon.count);
     var twice_area: f32 = 0;
@@ -413,10 +314,8 @@ fn shoelaceArea(polygon: *const box2d.Polygon) f32 {
     return @abs(twice_area) / 2;
 }
 
-/// Print one value and fail if it is not within `bound` of the expected one.
-///
-/// The finiteness test comes first and separately so that a NaN reports itself as
-/// one instead of as a difference that quietly compares false.
+/// Print a value and fail when it is outside `bound`.
+/// Check finiteness first so NaN cannot pass the comparison.
 fn checkWithin(w: *std.Io.Writer, what: []const u8, got: f32, expected: f32, bound: f32) !void {
     try w.print("{s: <34}{d:.6}\n", .{ what, got });
     if (std.math.isFinite(got) and @abs(got - expected) <= bound) return;
@@ -426,16 +325,13 @@ fn checkWithin(w: *std.Io.Writer, what: []const u8, got: f32, expected: f32, bou
     return error.ConsumerCheckFailed;
 }
 
-/// Print one value and fail if it is not within `tolerance` of the expected one.
+/// Check a value against the shared tolerance.
 fn check(w: *std.Io.Writer, what: []const u8, got: f32, expected: f32) !void {
     return checkWithin(w, what, got, expected, tolerance);
 }
 
-/// The provider this run should load, from `--provider <path>` or from
-/// `BOX2D_TEST_PROVIDER`.
-///
-/// Both are explicit. Nothing here looks in a default location, and a build that
-/// was not told which file to load says so rather than loading something else.
+/// Get the provider from `--provider` or `BOX2D_TEST_PROVIDER`.
+/// No default location is searched.
 fn providerRequest(init: std.process.Init) ConfigurationError![]const u8 {
     const args = init.minimal.args.toSlice(init.arena.allocator()) catch
         return noProvider();
@@ -450,8 +346,7 @@ fn providerRequest(init: std.process.Init) ConfigurationError![]const u8 {
         return noProvider();
 }
 
-/// Say which variable is missing. An error name on its own would send the next
-/// person into the loader instead of to the command line.
+/// Report the missing runtime provider configuration.
 fn noProvider() ConfigurationError {
     std.debug.print(
         "consumer: this is a runtime-loading build. Pass --provider <path>, or " ++

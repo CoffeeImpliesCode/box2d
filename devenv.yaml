@@ -1,31 +1,7 @@
 # SPDX-License-Identifier: MIT
-#
-# devenv.yaml — the input declaration for the Box2D SDK's development shell.
-# `devenv shell` reads this; `devenv.nix` and `.envrc` complete it.
-#
-# A revision, not a branch. A development shell that changes under you between
-# two runs of the same command cannot be the reason a result moved. Pinning
-# costs a lock update when a toolchain genuinely needs one, and that update is a
-# visible act.
-#
-# This is the nixpkgs *input devenv resolves*, and it is a different input from
-# the one `flake.nix` declares: there, `nixpkgs` is NixOS/nixpkgs at
-# c7def046b9a883d46974757852106483d741586f, because a flake package has to name
-# the package set it derives from directly. Both revisions are written down
-# rather than inherited, because a neighbouring lock is not a pin.
-#
-# The input is evaluated as a flake, and there is deliberately no `flake: false`
-# here. That key makes devenv's nixpkgs a plain source tree, and a plain source
-# tree has no `lib`, so every devenv subcommand stops in bootstrap at
-# `lib = nixpkgs.lib` with `error: attribute 'lib' missing`. Observed for this
-# SDK on 2026-10-04 across `devenv info`, `devenv tasks list`, `devenv shell`
-# and both canonical entries (`nix-acceptance-20261004T175328Z`, six
-# `box2d-devenv-*.log` receipts, exit 1 each). The key is gone; the revision
-# below is byte-for-byte what it was.
-#
-# There is no `devenv.lock` in this directory. The lock is the driver's to
-# create and to pin from an observed run, and no hash is invented here. Until
-# one exists, `devenv shell` resolves the revision below through that flake.
+# devenv input for the Box2D development shell.
+# Pin nixpkgs to a revision.
+# This nixpkgs input is separate from the pin in flake.nix.
 inputs:
   nixpkgs:
     url: github:cachix/devenv-nixpkgs/c2f38fe7f9e04d9aadd354d380f2bd40531d9737
