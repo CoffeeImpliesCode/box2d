@@ -58,8 +58,8 @@ const libc_noise_storage: Noise = blk: {
     @setEvalBranchQuota(100_000);
     const prefixes = .{ "", "__" };
     const suffixes = .{
-        "",     "f",      "l",      "f16",   "f32",   "f64",
-        "f128", "f16x",   "f32x",   "f64x",  "f128x", "ieee128",
+        "",     "f",    "l",    "f16",  "f32",   "f64",
+        "f128", "f16x", "f32x", "f64x", "f128x", "ieee128",
     };
     var storage: Noise = .{ .buf = undefined, .len = 0 };
     var bases = std.mem.splitScalar(u8, libc_math_bases, ',');
@@ -91,7 +91,6 @@ const libc_noise_storage: Noise = blk: {
 };
 
 /// Comma-separated expansion from the base and extra-name lists.
-
 /// No optional exports. `b2InternalAssertFcn` stays routed when declared:
 /// runtime mode has no linked archive to satisfy a direct extern.
 const libc_noise: []const u8 = libc_noise_storage.buf[0..libc_noise_storage.len];
