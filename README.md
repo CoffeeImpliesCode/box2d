@@ -35,10 +35,8 @@ WASI has no dynamic linker. Its Zig 0.17.0 C++ library also has no threads, so t
 
 ### Zig dependency
 
-```zon
-.dependencies = .{
-    .box2d = .{ .path = "../box2d" },
-};
+```sh
+zig fetch --save git+https://github.com/CoffeeImpliesCode/box2d#v3.1.1
 ```
 
 ```zig
